@@ -1,0 +1,51 @@
+# Trimble SketchUp / LayOut SDK — EULA forbids redistribution
+win/
+mac/
+sdk/
+*.dll
+*.dylib
+*.lib
+*.framework/
+SDK_*.zip
+
+# Compiled binaries
+*.exe
+*.o
+*.obj
+build/
+
+# Build artifacts + render outputs
+out/
+wineprefix/
+.wineprefix*
+
+# Local user files
+.openclaw/
+mydocs/
+node_modules/
+
+# Trash
+.DS_Store
+*.swp
+*.swo
+*~
+__pycache__/
+*.pyc
+
+# Job pipeline state
+pipeline/jobs_inbox/
+out/scenes_pdf/
+out/scenes_png/
+out/web/jobs/
+out/jobs/
+out/mesh/
+out/persp/
+out/pano_test/
+out/ai_enhanced/
+
+# Test artifact
+/tmp/
+*.crdownload
+
+# Local job runner state
+*.log
