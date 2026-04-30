@@ -12,24 +12,46 @@ require 'openssl'
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.2.3"
+  PLUGIN_VERSION = "0.2.4"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
-  # Poe models that accept text+image → image (i.e. support image editing).
-  # First entry is the default. Each: [poe_bot_name, display_label, hint]
+  # Poe image models. Each: [poe_id, label, group, hint, t2i_only]
+  # - "edit" group: accepts text+image → image (uses our SketchUp screenshot)
+  # - "t2i"  group: text → image only (ignores input image, generates from prompt)
+  # First entry is the default.
   IMAGE_MODELS = [
-    ["GPT-Image-2",      "GPT-Image-2",       "OpenAI · 最強 prompt adherence · 較貴"],
-    ["GPT-Image-1.5",    "GPT-Image-1.5",     "OpenAI · ChatGPT default · 平衡"],
-    ["GPT-Image-1",      "GPT-Image-1",       "OpenAI · 經濟版"],
-    ["GPT-Image-1-Mini", "GPT-Image-1 Mini",  "OpenAI · 最平 · 速度快"],
-    ["Flux-Kontext-Pro", "FLUX Kontext Pro",  "BFL · 圖像編輯專長 · 保持結構"],
-    ["Flux-Kontext-Max", "FLUX Kontext Max",  "BFL · 編輯最強 · 最貴"],
-    ["FLUX-2-Pro",       "FLUX 2 Pro",        "BFL · 多參考圖編輯"],
-    ["FLUX-2-Max",       "FLUX 2 Max",        "BFL · 旗艦"],
-    ["FLUX-2-Flex",      "FLUX 2 Flex",       "BFL · 大尺寸"],
-    ["FLUX-2-Dev",       "FLUX 2 Dev",        "BFL · open-weight"],
-    ["FLUX-Krea",        "FLUX Krea",         "BFL · Aesthetics tuned"],
+    # ----- Image editing (text+image → image) — recommended for SU plugin -----
+    ["GPT-Image-2",        "GPT-Image-2",         "edit", "OpenAI · 最強 prompt adherence",         false],
+    ["Nano-Banana-Pro",    "Nano-Banana Pro",     "edit", "Google · Gemini 3 Pro Image · ⭐ 最新 edit",  false],
+    ["Nano-Banana",        "Nano-Banana",         "edit", "Google · Gemini 2.5 Flash · 多語言文字",     false],
+    ["Flux-Kontext-Max",   "FLUX Kontext Max",    "edit", "BFL · 編輯最強旗艦",                          false],
+    ["Flux-Kontext-Pro",   "FLUX Kontext Pro",    "edit", "BFL · 專為 edit · 保結構好",                  false],
+    ["FLUX-2-Max",         "FLUX 2 Max",          "edit", "BFL · 多參考圖旗艦",                          false],
+    ["FLUX-2-Pro",         "FLUX 2 Pro",          "edit", "BFL · 多參考圖",                              false],
+    ["FLUX-2-Flex",        "FLUX 2 Flex",         "edit", "BFL · 大尺寸",                                false],
+    ["FLUX-2-Dev",         "FLUX 2 Dev",          "edit", "BFL · open-weight",                           false],
+    ["FLUX-Krea",          "FLUX Krea",           "edit", "BFL · Aesthetic tuned",                      false],
+    ["GPT-Image-1.5",      "GPT-Image-1.5",       "edit", "OpenAI · ChatGPT default",                    false],
+    ["GPT-Image-1",        "GPT-Image-1",         "edit", "OpenAI · 經濟",                                false],
+    ["GPT-Image-1-Mini",   "GPT-Image-1 Mini",    "edit", "OpenAI · 最平 · 快",                          false],
+    ["seededit-3.0",       "Seededit 3.0",        "edit", "Bytedance · edit",                            false],
+    ["ideogram",           "Ideogram",            "edit", "IdeogramAI",                                  false],
+    ["ideogram-v2",        "Ideogram v2",         "edit", "IdeogramAI v2",                               false],
+    ["qwen-edit",          "Qwen Edit",           "edit", "Alibaba edit",                                false],
+    ["sketch-to-image",    "Sketch-to-Image",     "edit", "Convert sketch → photo",                      false],
+
+    # ----- Text-to-image only (input image is IGNORED) -----
+    ["Nano-Banana-2",      "Nano-Banana 2",       "t2i",  "Google · 最新 T2I · 4K · 純 prompt 生成",      true],
+    ["Imagen-4-Ultra",     "Imagen 4 Ultra",      "t2i",  "Google · 最強 T2I",                            true],
+    ["Imagen-4",           "Imagen 4",            "t2i",  "Google T2I",                                   true],
+    ["Imagen-4-Fast",      "Imagen 4 Fast",       "t2i",  "Google T2I 速版",                              true],
+    ["FLUX-pro-1.1-ultra", "FLUX Pro 1.1 Ultra",  "t2i",  "BFL · 高解析 T2I",                              true],
+    ["FLUX-pro-1.1",       "FLUX Pro 1.1",        "t2i",  "BFL T2I",                                      true],
+    ["DALL-E-3",           "DALL-E 3",            "t2i",  "OpenAI 經典",                                  true],
+    ["seedream-5.0-lite",  "Seedream 5.0 Lite",   "t2i",  "Bytedance T2I",                                true],
+    ["recraft-v3",         "Recraft v3",          "t2i",  "Recraft 設計向",                               true],
+    ["luma-photon",        "Luma Photon",         "t2i",  "Luma photoreal",                               true],
   ]
 
   # Set this to a JSON URL to enable auto-update. The JSON should have:
@@ -179,17 +201,18 @@ module SuGptRender
 
   # ------ Poe API call -------------------------------------------------------
   def self.call_poe(api_key, image_path, prompt, model = "GPT-Image-2")
-    img_b64 = Base64.strict_encode64(File.binread(image_path))
+    meta = IMAGE_MODELS.find { |m| m[0] == model }
+    t2i_only = meta ? meta[4] : false
+
+    content = [{ "type" => "text", "text" => prompt }]
+    unless t2i_only
+      img_b64 = Base64.strict_encode64(File.binread(image_path))
+      content << { "type" => "image_url",
+                   "image_url" => { "url" => "data:image/png;base64,#{img_b64}" } }
+    end
     payload = {
       "model"    => model,
-      "messages" => [{
-        "role"    => "user",
-        "content" => [
-          { "type" => "text", "text" => prompt },
-          { "type" => "image_url",
-            "image_url" => { "url" => "data:image/png;base64,#{img_b64}" } }
-        ]
-      }],
+      "messages" => [{ "role" => "user", "content" => content }],
       "stream"   => false
     }
     res = http_post_json(POE_ENDPOINT,
@@ -226,10 +249,20 @@ module SuGptRender
     selected_model = cfg["model"] || IMAGE_MODELS.first[0]
     history_html = render_history_html
 
-    model_options_html = IMAGE_MODELS.map { |id, label, hint|
-      sel = (id == selected_model) ? " selected" : ""
-      "<option value=\"#{id}\"#{sel} title=\"#{CGI.escapeHTML(hint)}\">#{CGI.escapeHTML(label)}</option>"
-    }.join("\n")
+    edit_options = IMAGE_MODELS.select { |m| m[2] == "edit" }
+    t2i_options  = IMAGE_MODELS.select { |m| m[2] == "t2i" }
+    opt_html = lambda do |arr|
+      arr.map { |id, label, _grp, hint, _t2i|
+        sel = (id == selected_model) ? " selected" : ""
+        "<option value=\"#{id}\"#{sel} title=\"#{CGI.escapeHTML(hint)}\">#{CGI.escapeHTML(label)} — #{CGI.escapeHTML(hint)}</option>"
+      }.join("\n")
+    end
+    model_options_html =
+      "<optgroup label=\"Image-edit (uses your SketchUp view)\">\n" +
+      opt_html.call(edit_options) +
+      "\n</optgroup>\n<optgroup label=\"Text-to-image only (ignores SketchUp view)\">\n" +
+      opt_html.call(t2i_options) +
+      "\n</optgroup>"
 
     <<~HTML
       <!doctype html><html><head><meta charset="utf-8">
@@ -268,12 +301,15 @@ module SuGptRender
         .info-grid { display:grid; grid-template-columns: auto 1fr; gap:4px 12px; padding:8px 10px; background:#222; border-radius:4px; font-size:11px; margin-bottom:10px; }
         .info-grid div:nth-child(odd) { opacity:.6; }
         h3 { margin:14px 0 6px 0; font-size:11px; opacity:.6; text-transform:uppercase; letter-spacing:.5px; }
-        .history { max-height:240px; overflow-y:auto; }
-        .history .item { display:flex; gap:8px; padding:4px 0; align-items:center; }
+        .history { max-height:280px; overflow-y:auto; }
+        .history .item { display:flex; gap:8px; padding:5px 0; align-items:center; border-bottom:1px solid #222; }
         .history .item:hover { background:#252525; }
-        .history img { width:50px; height:34px; object-fit:cover; border-radius:3px; cursor:pointer; }
-        .history .ts { font-size:11px; opacity:.6; flex:1; cursor:pointer; }
-        .history button.small { padding:3px 6px; font-size:11px; opacity:.6; }
+        .history img { width:54px; height:36px; object-fit:cover; border-radius:3px; cursor:pointer; flex-shrink:0; }
+        .history .meta { flex:1; cursor:pointer; min-width:0; }
+        .history .meta .ts { font-size:11px; opacity:.85; }
+        .history .meta .sub { font-size:10px; opacity:.55; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .history .meta .dim { margin-left:8px; opacity:.5; }
+        .history button.small { padding:3px 6px; font-size:11px; opacity:.6; flex-shrink:0; }
         .history button.small:hover { opacity:1; }
         #upd { padding:8px; background:#3a2c1a; border-radius:4px; font-size:11px; margin-bottom:10px; display:none; }
         #upd.show { display:block; }
@@ -326,6 +362,10 @@ module SuGptRender
           <img id="preview_img" style="display:none" onclick="openCurrentImage()">
           <div class="hint">🔍 click to open full size</div>
         </div>
+        <div class="small-btns" id="refine_row" style="display:none">
+          <button class="small" onclick="refineCurrent()" title="用呢張結果做 input 再 render，加 tweak 指示">↻ Refine this</button>
+          <button class="small" onclick="openCurrentImage()">Open full size</button>
+        </div>
 
         <h3>History</h3>
         <div class="history" id="history">#{history_html}</div>
@@ -347,15 +387,25 @@ module SuGptRender
         function renderPreview() {
           const img = document.getElementById('preview_img');
           const empty = document.getElementById('preview_empty');
+          const refineRow = document.getElementById('refine_row');
           const url = currentTab === 'enh' ? lastEnh : lastRaw;
           if (url) {
             img.src = url + '?_=' + Date.now();
             img.style.display = 'block';
             empty.style.display = 'none';
+            refineRow.style.display = lastEnhPath ? 'flex' : 'none';
           } else {
             img.style.display = 'none';
             empty.style.display = 'block';
+            refineRow.style.display = 'none';
           }
+        }
+        function refineCurrent() {
+          const path = currentTab === 'enh' ? lastEnhPath : lastRawPath;
+          if (path) sketchup.refine(path);
+        }
+        function refineHistory(path) {
+          if (path) sketchup.refine(path);
         }
         function switchTab(t) {
           currentTab = t;
@@ -411,10 +461,15 @@ module SuGptRender
     Dir.glob(File.join(dir, "*_raw.png")).each do |raw|
       stem = File.basename(raw, "_raw.png")
       enh = File.join(dir, "#{stem}_enhanced.png")
-      pairs[stem] = { raw: raw, enh: File.exist?(enh) ? enh : nil }
+      meta_path = File.join(dir, "#{stem}_meta.json")
+      meta = nil
+      if File.exist?(meta_path)
+        meta = JSON.parse(File.read(meta_path)) rescue nil
+      end
+      pairs[stem] = { raw: raw, enh: File.exist?(enh) ? enh : nil, meta: meta }
     end
 
-    items = pairs.keys.sort.reverse[0,12]
+    items = pairs.keys.sort.reverse[0,20]
     return "<div class='empty' style='padding:8px;opacity:.5'>No renders yet</div>" if items.empty?
 
     items.map do |stem|
@@ -424,13 +479,40 @@ module SuGptRender
       enh_url = p[:enh] ? "file://" + p[:enh].gsub("\\", "/") : nil
       raw_path = p[:raw] || ""
       enh_path = p[:enh] || ""
-      ts = stem[0,15].gsub(/^(\d{8})_(\d{6})/, '\1 \2')
+
+      # Date / time formatting
+      ts_raw = stem[0,15]   # YYYYMMDD_HHMMSS
+      time_part = ts_raw.length >= 15 ? "#{ts_raw[9,2]}:#{ts_raw[11,2]}" : ""
+      date_part = ts_raw.length >= 8  ? "#{ts_raw[4,2]}/#{ts_raw[6,2]}" : ""
+
+      # Model + dim from sidecar
+      model_label = "?"
+      dim_label = ""
+      elapsed_label = ""
+      if p[:meta]
+        m = IMAGE_MODELS.find { |x| x[0] == p[:meta]["model"] }
+        model_label = m ? m[1] : p[:meta]["model"].to_s
+        if p[:meta]["width"] && p[:meta]["height"]
+          dim_label = "#{p[:meta]['width']}×#{p[:meta]['height']}"
+        end
+        elapsed_label = p[:meta]["elapsed_sec"] ? "#{p[:meta]['elapsed_sec'].round}s" : ""
+      end
+
       url_args = "#{raw_url.to_json}, #{enh_url ? enh_url.to_json : 'null'}, #{raw_path.to_json}, #{enh_path.to_json}"
-      "<div class='item'>" \
-      "<img src=\"file://#{thumb.gsub('\\','/')}\" onclick=\"loadHistoryItem(#{url_args})\" title=\"Click thumbnail to preview\">" \
-      "<span class='ts' onclick=\"loadHistoryItem(#{url_args})\">#{ts}</span>" \
-      "<button class='small' onclick=\"openImage(#{(enh_path.empty? ? raw_path : enh_path).to_json})\" title='Open full size'>↗</button>" \
-      "</div>"
+      open_path = enh_path.empty? ? raw_path : enh_path
+
+      refine_target = enh_path.empty? ? raw_path : enh_path
+      <<~HTML
+        <div class='item'>
+          <img src="file://#{thumb.gsub('\\','/')}" onclick="loadHistoryItem(#{url_args})" title="Click thumbnail to preview">
+          <div class='meta' onclick="loadHistoryItem(#{url_args})">
+            <div class='ts'>#{date_part} #{time_part}</div>
+            <div class='sub'>#{CGI.escapeHTML(model_label)}<span class='dim'>#{dim_label}</span><span class='dim'>#{elapsed_label}</span></div>
+          </div>
+          <button class='small' onclick="refineHistory(#{refine_target.to_json})" title='Refine this'>↻</button>
+          <button class='small' onclick="openImage(#{open_path.to_json})" title='Open full size'>↗</button>
+        </div>
+      HTML
     end.join("\n")
   end
 
@@ -465,6 +547,9 @@ module SuGptRender
       if path && !path.to_s.empty? && File.exist?(path)
         UI.openURL("file://" + path.to_s.gsub("\\", "/"))
       end
+    end
+    @tray.add_action_callback("refine") do |_, image_path|
+      open_refine_dialog(image_path.to_s)
     end
     @tray.add_action_callback("edit_prompt")     { |_, _| edit_prompt }
     @tray.add_action_callback("set_key")         { |_, _| set_api_key; refresh_tray }
@@ -536,12 +621,27 @@ module SuGptRender
 
     push_status("Calling Poe (#{model}) ~30-60s...", "busy")
 
+    started_at = Time.now
     # Background HTTP — Net::HTTP releases GIL during I/O so this DOES run async.
     @bg_thread = Thread.new do
       begin
         url = call_poe(api_key, raw_path, prompt, model)
         out_path = raw_path.sub(/_raw\.png$/, "_enhanced.png")
         download(url, out_path)
+        # Persist render metadata sidecar
+        meta_path = raw_path.sub(/_raw\.png$/, "_meta.json")
+        meta_data = {
+          "raw"      => File.basename(raw_path),
+          "enhanced" => File.basename(out_path),
+          "model"    => model,
+          "width"    => width,
+          "height"   => height,
+          "prompt"   => prompt,
+          "started_at"  => started_at.iso8601,
+          "finished_at" => Time.now.iso8601,
+          "elapsed_sec" => (Time.now - started_at).round(1),
+        }
+        File.write(meta_path, JSON.pretty_generate(meta_data))
         Thread.current[:result] = { ok: true, raw: raw_path, enh: out_path }
       rescue => e
         Thread.current[:result] = { ok: false, raw: raw_path, error: e.message }
@@ -562,6 +662,145 @@ module SuGptRender
           push_history
         else
           push_status("Failed: #{result[:error]}", "err")
+        end
+      end
+    end
+  end
+
+  # ------ refine flow --------------------------------------------------------
+  def self.open_refine_dialog(image_path)
+    unless File.exist?(image_path)
+      UI.messagebox("Image not found:\n#{image_path}")
+      return
+    end
+    cfg = load_config
+    base_prompt = cfg["prompt"] || DEFAULT_PROMPT
+
+    dlg = UI::HtmlDialog.new(
+      dialog_title:    "#{PLUGIN_NAME} — Refine",
+      preferences_key: "su_gpt_render_refine_dlg",
+      scrollable:      true, resizable: true,
+      width: 720, height: 640,
+      style: UI::HtmlDialog::STYLE_DIALOG
+    )
+
+    img_url = "file://" + image_path.gsub("\\", "/")
+    base_html = CGI.escapeHTML(base_prompt)
+
+    html = <<~HTML
+      <!doctype html><html><head><meta charset="utf-8">
+      <style>
+        body { font-family:-apple-system,"Helvetica Neue","PingFang HK","Microsoft JhengHei",sans-serif; margin:0; padding:14px; background:#f5f5f5; color:#222; }
+        h2 { margin:0 0 8px 0; font-size:14px; }
+        .twocol { display:grid; grid-template-columns: 1fr 1fr; gap:14px; }
+        img { max-width:100%; max-height:280px; display:block; border-radius:4px; box-shadow:0 1px 6px rgba(0,0,0,.15); }
+        textarea { width:100%; min-height:140px; box-sizing:border-box; font-family:"SF Mono",Consolas,monospace; font-size:12.5px; padding:10px; border:1px solid #ccc; border-radius:4px; resize:vertical; }
+        label { font-size:11px; opacity:.7; display:block; margin-bottom:4px; }
+        .row { margin-top:12px; display:flex; gap:8px; align-items:center; }
+        button { padding:9px 16px; border:1px solid #aaa; border-radius:4px; background:#fff; cursor:pointer; font-size:13px; }
+        button.primary { background:#2c80c0; color:#fff; border-color:#2c80c0; font-weight:600; }
+        .spacer { flex:1; }
+        details { margin-top:10px; }
+        details summary { cursor:pointer; font-size:12px; color:#555; }
+        details textarea { min-height:120px; margin-top:6px; }
+      </style></head><body>
+      <h2>Refine this render</h2>
+      <p style="margin:0 0 12px 0;font-size:12px;opacity:.7">用左邊張圖做 input，加新指示再 render。新 prompt 會 prepend 到原 prompt 之前。</p>
+      <div class="twocol">
+        <div>
+          <label>Input image (refine 用呢張)</label>
+          <img src="#{img_url}">
+        </div>
+        <div>
+          <label>Tweak instructions（中／英 OK）</label>
+          <textarea id="tweak" placeholder="例：&#10;- darker walnut wood instead of light oak&#10;- warmer evening lighting&#10;- add visible window light from left&#10;- slightly more contrast"></textarea>
+          <details>
+            <summary>Show full base prompt (read-only)</summary>
+            <textarea readonly>#{base_html}</textarea>
+          </details>
+        </div>
+      </div>
+      <div class="row">
+        <button class="primary" onclick="window.location='skp:go@'+encodeURIComponent(document.getElementById('tweak').value)">↻ Refine</button>
+        <button onclick="window.location='skp:cancel@'">Cancel</button>
+        <div class="spacer"></div>
+        <small style="opacity:.5">Output saved as new <code>_enhanced.png</code></small>
+      </div>
+      </body></html>
+    HTML
+
+    dlg.set_html(html)
+    dlg.add_action_callback("go") do |_, tweak_enc|
+      tweak = CGI.unescape(tweak_enc.to_s).strip
+      dlg.close
+      do_refine_async(image_path, tweak)
+    end
+    dlg.add_action_callback("cancel") { |_, _| dlg.close }
+    dlg.show
+  end
+
+  def self.do_refine_async(image_path, tweak)
+    api_key = get_api_key
+    return unless api_key
+    if @bg_thread && @bg_thread.alive?
+      UI.messagebox("Already rendering. Wait for the current job to finish.")
+      return
+    end
+    cfg = load_config
+    base_prompt = cfg["prompt"] || DEFAULT_PROMPT
+    model = cfg["model"] || IMAGE_MODELS.first[0]
+    width  = cfg["width"]  || 1536
+    height = cfg["height"] || 1024
+
+    # Compose prompt: tweak first, then base. Tweak takes precedence.
+    final_prompt = if tweak.empty?
+                     base_prompt
+                   else
+                     "TWEAK INSTRUCTIONS (apply these changes):\n#{tweak}\n\nORIGINAL PROMPT:\n#{base_prompt}"
+                   end
+
+    # New filenames: <ts>_<base>_refine_raw.png + ..._refine_enhanced.png
+    src_dir = File.dirname(image_path)
+    src_stem = File.basename(image_path, ".png").sub(/_(raw|enhanced)$/, "")
+    timestamp = Time.now.strftime("%Y%m%d_%H%M%S")
+    raw_path = File.join(src_dir, "#{timestamp}_#{src_stem}_refine_raw.png")
+    FileUtils.cp(image_path, raw_path)   # raw = the source image we're refining
+
+    push_busy(true)
+    push_status("Refining via Poe (#{model}) ~30-60s...", "busy")
+    push_preview(raw_path, nil)
+
+    started_at = Time.now
+    @bg_thread = Thread.new do
+      begin
+        url = call_poe(api_key, raw_path, final_prompt, model)
+        out_path = raw_path.sub(/_raw\.png$/, "_enhanced.png")
+        download(url, out_path)
+        meta_path = raw_path.sub(/_raw\.png$/, "_meta.json")
+        File.write(meta_path, JSON.pretty_generate({
+          "raw" => File.basename(raw_path), "enhanced" => File.basename(out_path),
+          "model" => model, "width" => width, "height" => height,
+          "prompt" => final_prompt, "tweak" => tweak,
+          "refined_from" => File.basename(image_path),
+          "started_at" => started_at.iso8601, "finished_at" => Time.now.iso8601,
+          "elapsed_sec" => (Time.now - started_at).round(1),
+        }))
+        Thread.current[:result] = { ok: true, raw: raw_path, enh: out_path }
+      rescue => e
+        Thread.current[:result] = { ok: false, raw: raw_path, error: e.message }
+      end
+    end
+    @bg_timer = UI.start_timer(0.5, true) do
+      if @bg_thread && !@bg_thread.alive?
+        UI.stop_timer(@bg_timer); @bg_timer = nil
+        result = @bg_thread[:result]; @bg_thread = nil
+        push_busy(false)
+        if result[:ok]
+          push_status("Refined · #{File.basename(result[:enh])}", "ok")
+          push_preview(result[:raw], result[:enh])
+          push_history
+        else
+          push_status("Refine failed: #{result[:error]}", "err")
         end
       end
     end

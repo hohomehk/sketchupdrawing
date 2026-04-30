@@ -1,5 +1,5 @@
 {
-  "version": "0.2.3",
+  "version": "0.2.4",
   "rb_url": "https://raw.githubusercontent.com/hohomehk/sketchupdrawing/main/sketchup_plugin/su_gpt_render/su_gpt_render.rb",
-  "notes": "v0.2.3 — Model picker dropdown (11 Poe image models incl. GPT-Image-1/1.5/2, FLUX-Kontext, FLUX-2). Click preview / history thumbnail to open full size in OS image viewer. Per-model render history."
+  "notes": "v0.2.4 — Full image-model list (28 models): Nano-Banana Pro/2, Imagen 4 Ultra, FLUX Kontext Max, Seededit, Qwen-Edit, etc. Dropdown grouped into Image-edit / T2I-only. Refine flow: re-render any result with delta tweak prompt. History gains model + dimension + elapsed time labels. Sidecar _meta.json saved per render."
 }
