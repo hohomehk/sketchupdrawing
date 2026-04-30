@@ -8,10 +8,11 @@ require 'net/http'
 require 'uri'
 require 'base64'
 require 'cgi'
+require 'openssl'
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.2.1"
+  PLUGIN_VERSION = "0.2.2"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -91,10 +92,78 @@ module SuGptRender
     raw_path
   end
 
-  # ------ Poe API call (HTTP) ------------------------------------------------
+  # ------ HTTPS plumbing -----------------------------------------------------
+  # Configures Net::HTTP for SketchUp's bundled Ruby/OpenSSL which ships with
+  # quirky defaults. Forces TLS 1.2+, picks a sensible CA bundle, and lets the
+  # user opt out of cert verification as a last resort (config: verify_ssl=false).
+  def self.configure_http(http, scheme)
+    http.read_timeout = 180
+    http.open_timeout = 30
+    if scheme == "https"
+      http.use_ssl = true
+      begin
+        # Force a modern TLS — SU's old OpenSSL otherwise tries SSL3/TLS1.0
+        # which Cloudflare (Poe's CDN) drops mid-handshake.
+        http.min_version = OpenSSL::SSL::TLS1_2_VERSION if defined?(OpenSSL::SSL::TLS1_2_VERSION)
+      rescue NoMethodError, NameError
+        # very old OpenSSL — fall back to ssl_version
+        http.ssl_version = :TLSv1_2 rescue nil
+      end
+      cfg = load_config
+      if cfg["verify_ssl"] == false
+        http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+      else
+        http.verify_mode = OpenSSL::SSL::VERIFY_PEER
+        # If user supplied a CA bundle path, use it
+        if cfg["ca_file"] && File.exist?(cfg["ca_file"])
+          http.ca_file = cfg["ca_file"]
+        elsif ENV["SSL_CERT_FILE"] && File.exist?(ENV["SSL_CERT_FILE"])
+          http.ca_file = ENV["SSL_CERT_FILE"]
+        end
+      end
+    end
+    http
+  end
+
+  # POST with retry on transient SSL / connection errors.
+  def self.http_post_json(url, headers, body, attempts: 3)
+    uri = URI.parse(url)
+    last_err = nil
+    attempts.times do |i|
+      http = Net::HTTP.new(uri.host, uri.port)
+      configure_http(http, uri.scheme)
+      req = Net::HTTP::Post.new(uri.request_uri)
+      headers.each { |k, v| req[k] = v }
+      req.body = body
+      begin
+        return http.request(req)
+      rescue OpenSSL::SSL::SSLError, Errno::ECONNRESET, Errno::EPIPE, Net::OpenTimeout, Net::ReadTimeout, EOFError => e
+        last_err = e
+        sleep(1.5 + i * 2.5) unless i == attempts - 1
+      end
+    end
+    raise "HTTPS failed after #{attempts} attempts: #{last_err.class}: #{last_err.message}\n\nIf this persists, try Set SSL Verify (off) in the menu."
+  end
+
+  def self.http_get(url, attempts: 3)
+    uri = URI.parse(url)
+    last_err = nil
+    attempts.times do |i|
+      http = Net::HTTP.new(uri.host, uri.port)
+      configure_http(http, uri.scheme)
+      begin
+        return http.request(Net::HTTP::Get.new(uri.request_uri))
+      rescue OpenSSL::SSL::SSLError, Errno::ECONNRESET, Errno::EPIPE, Net::OpenTimeout, Net::ReadTimeout, EOFError => e
+        last_err = e
+        sleep(1.0 + i * 2.0) unless i == attempts - 1
+      end
+    end
+    raise "HTTPS GET failed: #{last_err.class}: #{last_err.message}"
+  end
+
+  # ------ Poe API call -------------------------------------------------------
   def self.call_poe(api_key, image_path, prompt)
     img_b64 = Base64.strict_encode64(File.binread(image_path))
-
     payload = {
       "model"    => "GPT-Image-2",
       "messages" => [{
@@ -107,41 +176,21 @@ module SuGptRender
       }],
       "stream"   => false
     }
-
-    uri = URI.parse(POE_ENDPOINT)
-    http = Net::HTTP.new(uri.host, uri.port)
-    http.use_ssl = true
-    http.read_timeout = 180
-    http.open_timeout = 30
-
-    req = Net::HTTP::Post.new(uri.path)
-    req["Authorization"] = "Bearer #{api_key}"
-    req["Content-Type"]  = "application/json"
-    req.body = JSON.generate(payload)
-
-    res = http.request(req)
+    res = http_post_json(POE_ENDPOINT,
+      { "Authorization" => "Bearer #{api_key}", "Content-Type" => "application/json" },
+      JSON.generate(payload))
     unless res.is_a?(Net::HTTPSuccess)
       raise "Poe API HTTP #{res.code}: #{res.body[0,500]}"
     end
-    body = JSON.parse(res.body)
-    content = body.dig("choices", 0, "message", "content").to_s
-    # Poe returns markdown image: ![alt text](https://pfst.cf2.poecdn.net/.../hash?w=...&h=...)
-    # The URL is hash-based with NO file extension. Match the markdown image syntax
-    # and the parenthesized URL directly.
-    m = content.match(/!\[[^\]]*\]\(([^)\s]+)\)/) ||             # markdown image syntax
-        content.match(/(https?:\/\/[^\s)\]]+)/)                  # any bare URL fallback
+    content = JSON.parse(res.body).dig("choices", 0, "message", "content").to_s
+    m = content.match(/!\[[^\]]*\]\(([^)\s]+)\)/) ||
+        content.match(/(https?:\/\/[^\s)\]]+)/)
     raise "No image URL in response: #{content[0,300]}" unless m
     m[1]
   end
 
   def self.download(url, out_path)
-    uri = URI.parse(url)
-    http = Net::HTTP.new(uri.host, uri.port)
-    http.use_ssl = (uri.scheme == "https")
-    http.read_timeout = 120
-
-    req = Net::HTTP::Get.new(uri.request_uri)
-    res = http.request(req)
+    res = http_get(url)
     raise "Download HTTP #{res.code}" unless res.is_a?(Net::HTTPSuccess)
     File.binwrite(out_path, res.body)
     out_path
@@ -532,12 +581,7 @@ module SuGptRender
   def self.check_update(verbose)
     return if UPDATE_MANIFEST_URL.nil? || UPDATE_MANIFEST_URL.empty?
     begin
-      uri = URI.parse(UPDATE_MANIFEST_URL)
-      http = Net::HTTP.new(uri.host, uri.port)
-      http.use_ssl = (uri.scheme == "https")
-      http.read_timeout = 10
-      http.open_timeout = 5
-      res = http.request(Net::HTTP::Get.new(uri.request_uri))
+      res = http_get(UPDATE_MANIFEST_URL, attempts: 2)
       raise "HTTP #{res.code}" unless res.is_a?(Net::HTTPSuccess)
       data = JSON.parse(res.body)
       remote_ver = data["version"].to_s
@@ -571,18 +615,13 @@ module SuGptRender
   def self.download_update
     return if UPDATE_MANIFEST_URL.nil? || UPDATE_MANIFEST_URL.empty?
     begin
-      uri = URI.parse(UPDATE_MANIFEST_URL)
-      http = Net::HTTP.new(uri.host, uri.port)
-      http.use_ssl = (uri.scheme == "https")
-      res = http.request(Net::HTTP::Get.new(uri.request_uri))
+      res = http_get(UPDATE_MANIFEST_URL)
       raise "manifest HTTP #{res.code}" unless res.is_a?(Net::HTTPSuccess)
       data = JSON.parse(res.body)
       rb_url = data["rb_url"].to_s
       raise "no rb_url in manifest" if rb_url.empty?
 
-      uri2 = URI.parse(rb_url)
-      http2 = Net::HTTP.new(uri2.host, uri2.port); http2.use_ssl = (uri2.scheme == "https")
-      res2 = http2.request(Net::HTTP::Get.new(uri2.request_uri))
+      res2 = http_get(rb_url)
       raise "rb HTTP #{res2.code}" unless res2.is_a?(Net::HTTPSuccess)
 
       target = __FILE__
@@ -593,6 +632,39 @@ module SuGptRender
     end
   end
 
+  def self.toggle_ssl_verify
+    cfg = load_config
+    current = cfg["verify_ssl"] != false
+    new_val = !current
+    cfg["verify_ssl"] = new_val
+    save_config(cfg)
+    if new_val
+      UI.messagebox("SSL verification: ON (secure, default)")
+    else
+      UI.messagebox("SSL verification: OFF\n\nWARNING: this disables certificate validation. Use only if normal mode hits SSL errors. Re-enable when possible.")
+    end
+  end
+
+  def self.diagnose
+    info = []
+    info << "Plugin: v#{PLUGIN_VERSION}"
+    info << "SketchUp: #{Sketchup.version}"
+    info << "Ruby: #{RUBY_VERSION} (#{RUBY_PLATFORM})"
+    info << "OpenSSL: #{OpenSSL::OPENSSL_VERSION rescue '?'}"
+    info << "OpenSSL CA: #{OpenSSL::X509::DEFAULT_CERT_FILE rescue '?'}"
+    cfg = load_config
+    info << "verify_ssl: #{cfg['verify_ssl'] == false ? 'OFF' : 'ON (default)'}"
+    info << ""
+    info << "TLS test to api.poe.com..."
+    begin
+      res = http_get("https://api.poe.com/", attempts: 1)
+      info << "  → HTTP #{res.code} ✓"
+    rescue => e
+      info << "  → FAILED: #{e.class}: #{e.message[0,200]}"
+    end
+    UI.messagebox(info.join("\n"))
+  end
+
   # ------ menu ---------------------------------------------------------------
   unless file_loaded?(__FILE__)
     menu = UI.menu("Extensions").add_submenu(PLUGIN_NAME)
@@ -600,6 +672,8 @@ module SuGptRender
     menu.add_item("Edit Prompt...") { SuGptRender.edit_prompt }
     menu.add_separator
     menu.add_item("Set Poe API Key...") { SuGptRender.set_api_key }
+    menu.add_item("Toggle SSL Verify (debug)") { SuGptRender.toggle_ssl_verify }
+    menu.add_item("Diagnose Network") { SuGptRender.diagnose }
     menu.add_item("Check for Updates") { SuGptRender.check_update(true) }
     file_loaded(__FILE__)
   end
