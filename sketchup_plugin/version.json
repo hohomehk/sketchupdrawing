@@ -1,5 +1,5 @@
 {
-  "version": "0.2.2",
+  "version": "0.2.3",
   "rb_url": "https://raw.githubusercontent.com/hohomehk/sketchupdrawing/main/sketchup_plugin/su_gpt_render/su_gpt_render.rb",
-  "notes": "v0.2.2 — Hardened HTTPS: force TLS 1.2, retry with backoff for SSL handshake failures, plus 'Toggle SSL Verify' + 'Diagnose Network' menu items for troubleshooting."
+  "notes": "v0.2.3 — Model picker dropdown (11 Poe image models incl. GPT-Image-1/1.5/2, FLUX-Kontext, FLUX-2). Click preview / history thumbnail to open full size in OS image viewer. Per-model render history."
 }

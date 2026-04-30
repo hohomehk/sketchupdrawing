@@ -12,9 +12,25 @@ require 'openssl'
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.2.2"
+  PLUGIN_VERSION = "0.2.3"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
+
+  # Poe models that accept text+image → image (i.e. support image editing).
+  # First entry is the default. Each: [poe_bot_name, display_label, hint]
+  IMAGE_MODELS = [
+    ["GPT-Image-2",      "GPT-Image-2",       "OpenAI · 最強 prompt adherence · 較貴"],
+    ["GPT-Image-1.5",    "GPT-Image-1.5",     "OpenAI · ChatGPT default · 平衡"],
+    ["GPT-Image-1",      "GPT-Image-1",       "OpenAI · 經濟版"],
+    ["GPT-Image-1-Mini", "GPT-Image-1 Mini",  "OpenAI · 最平 · 速度快"],
+    ["Flux-Kontext-Pro", "FLUX Kontext Pro",  "BFL · 圖像編輯專長 · 保持結構"],
+    ["Flux-Kontext-Max", "FLUX Kontext Max",  "BFL · 編輯最強 · 最貴"],
+    ["FLUX-2-Pro",       "FLUX 2 Pro",        "BFL · 多參考圖編輯"],
+    ["FLUX-2-Max",       "FLUX 2 Max",        "BFL · 旗艦"],
+    ["FLUX-2-Flex",      "FLUX 2 Flex",       "BFL · 大尺寸"],
+    ["FLUX-2-Dev",       "FLUX 2 Dev",        "BFL · open-weight"],
+    ["FLUX-Krea",        "FLUX Krea",         "BFL · Aesthetics tuned"],
+  ]
 
   # Set this to a JSON URL to enable auto-update. The JSON should have:
   #   { "version": "0.3.0", "rb_url": "https://.../su_gpt_render.rb", "notes": "..." }
@@ -162,10 +178,10 @@ module SuGptRender
   end
 
   # ------ Poe API call -------------------------------------------------------
-  def self.call_poe(api_key, image_path, prompt)
+  def self.call_poe(api_key, image_path, prompt, model = "GPT-Image-2")
     img_b64 = Base64.strict_encode64(File.binread(image_path))
     payload = {
-      "model"    => "GPT-Image-2",
+      "model"    => model,
       "messages" => [{
         "role"    => "user",
         "content" => [
@@ -207,7 +223,13 @@ module SuGptRender
     has_key = !(cfg["poe_api_key"].to_s.strip.empty?)
     width = cfg["width"] || 1536
     height = cfg["height"] || 1024
+    selected_model = cfg["model"] || IMAGE_MODELS.first[0]
     history_html = render_history_html
+
+    model_options_html = IMAGE_MODELS.map { |id, label, hint|
+      sel = (id == selected_model) ? " selected" : ""
+      "<option value=\"#{id}\"#{sel} title=\"#{CGI.escapeHTML(hint)}\">#{CGI.escapeHTML(label)}</option>"
+    }.join("\n")
 
     <<~HTML
       <!doctype html><html><head><meta charset="utf-8">
@@ -231,9 +253,14 @@ module SuGptRender
         #status.busy { border-color:#f80; color:#fc6; }
         #status.ok { border-color:#5c5; color:#cfc; }
         #status.err { border-color:#c44; color:#fcc; }
-        .preview { background:#0a0a0a; border:1px solid #2a2a2a; border-radius:4px; padding:6px; margin-bottom:10px; min-height:120px; }
-        .preview img { width:100%; display:block; border-radius:3px; }
+        .preview { background:#0a0a0a; border:1px solid #2a2a2a; border-radius:4px; padding:6px; margin-bottom:10px; min-height:120px; position:relative; }
+        .preview img { width:100%; display:block; border-radius:3px; cursor:zoom-in; transition:opacity .12s; }
+        .preview img:hover { opacity:.85; }
+        .preview img:after { content:"🔍 click to open full size"; position:absolute; }
+        .preview .hint { position:absolute; bottom:10px; right:10px; background:rgba(0,0,0,.7); color:#fff; font-size:10px; padding:3px 7px; border-radius:3px; pointer-events:none; opacity:0; transition:opacity .15s; }
+        .preview:hover .hint { opacity:1; }
         .preview .empty { padding:20px; text-align:center; opacity:.4; font-size:11px; }
+        select { background:#2a2a2a; color:#eee; border:1px solid #3a3a3a; padding:5px 8px; border-radius:4px; width:100%; font-size:13px; }
         .tabs { display:flex; gap:4px; margin-bottom:6px; }
         .tabs button { padding:5px 10px; font-size:11px; background:#222; }
         .tabs button.active { background:#2c80c0; }
@@ -242,10 +269,12 @@ module SuGptRender
         .info-grid div:nth-child(odd) { opacity:.6; }
         h3 { margin:14px 0 6px 0; font-size:11px; opacity:.6; text-transform:uppercase; letter-spacing:.5px; }
         .history { max-height:240px; overflow-y:auto; }
-        .history .item { display:flex; gap:8px; padding:4px 0; align-items:center; cursor:pointer; }
+        .history .item { display:flex; gap:8px; padding:4px 0; align-items:center; }
         .history .item:hover { background:#252525; }
-        .history img { width:50px; height:34px; object-fit:cover; border-radius:3px; }
-        .history .ts { font-size:11px; opacity:.6; flex:1; }
+        .history img { width:50px; height:34px; object-fit:cover; border-radius:3px; cursor:pointer; }
+        .history .ts { font-size:11px; opacity:.6; flex:1; cursor:pointer; }
+        .history button.small { padding:3px 6px; font-size:11px; opacity:.6; }
+        .history button.small:hover { opacity:1; }
         #upd { padding:8px; background:#3a2c1a; border-radius:4px; font-size:11px; margin-bottom:10px; display:none; }
         #upd.show { display:block; }
       </style>
@@ -258,6 +287,13 @@ module SuGptRender
         <div id="upd"></div>
 
         <div id="status">Ready · API key #{has_key ? "✓" : "<span style='color:#fa6'>not set</span>"}</div>
+
+        <div class="row">
+          <label style="font-size:11px;opacity:.7;display:block;margin-bottom:3px">Model</label>
+          <select id="model" onchange="onModelChange()">
+            #{model_options_html}
+          </select>
+        </div>
 
         <div class="row">
           <button id="renderBtn" class="primary" style="width:100%" onclick="doRender()">Render Current View</button>
@@ -287,22 +323,25 @@ module SuGptRender
         </div>
         <div class="preview">
           <div id="preview_empty" class="empty">Render 完會喺度顯示</div>
-          <img id="preview_img" style="display:none">
+          <img id="preview_img" style="display:none" onclick="openCurrentImage()">
+          <div class="hint">🔍 click to open full size</div>
         </div>
 
         <h3>History</h3>
         <div class="history" id="history">#{history_html}</div>
 
         <script>
-        let lastRaw = null, lastEnh = null, currentTab = 'enh';
+        let lastRaw = null, lastEnh = null, currentTab = 'enh', lastRawPath = null, lastEnhPath = null;
         function setStatus(msg, cls) {
           const s = document.getElementById('status');
           s.textContent = msg;
           s.className = cls || '';
         }
-        function setPreview(rawUrl, enhUrl) {
-          if (rawUrl) lastRaw = rawUrl;
-          if (enhUrl) lastEnh = enhUrl;
+        function setPreview(rawUrl, enhUrl, rawPath, enhPath) {
+          if (rawUrl !== undefined) lastRaw = rawUrl;
+          if (enhUrl !== undefined) lastEnh = enhUrl;
+          if (rawPath !== undefined) lastRawPath = rawPath;
+          if (enhPath !== undefined) lastEnhPath = enhPath;
           renderPreview();
         }
         function renderPreview() {
@@ -336,11 +375,27 @@ module SuGptRender
           document.getElementById('history').innerHTML = html;
         }
         function doRender() {
-          const opts = { width: parseInt(document.getElementById('w').value), height: parseInt(document.getElementById('h').value) };
+          const opts = {
+            width: parseInt(document.getElementById('w').value),
+            height: parseInt(document.getElementById('h').value),
+            model: document.getElementById('model').value
+          };
           sketchup.render(JSON.stringify(opts));
         }
+        function onModelChange() {
+          sketchup.set_model(document.getElementById('model').value);
+        }
         function cmd(name) { sketchup[name](''); }
-        function loadHistoryItem(rawUrl, enhUrl) { setPreview(rawUrl, enhUrl); }
+        function openCurrentImage() {
+          const path = currentTab === 'enh' ? lastEnhPath : lastRawPath;
+          if (path) sketchup.open_file(path);
+        }
+        function openImage(path) {
+          if (path) sketchup.open_file(path);
+        }
+        function loadHistoryItem(rawUrl, enhUrl, rawPath, enhPath) {
+          setPreview(rawUrl, enhUrl, rawPath, enhPath);
+        }
         </script>
       </body></html>
     HTML
@@ -366,10 +421,16 @@ module SuGptRender
       p = pairs[stem]
       thumb = p[:enh] || p[:raw]
       raw_url = "file://" + (p[:raw] || "").gsub("\\", "/")
-      enh_url = p[:enh] ? "file://" + p[:enh].gsub("\\", "/") : "null"
+      enh_url = p[:enh] ? "file://" + p[:enh].gsub("\\", "/") : nil
+      raw_path = p[:raw] || ""
+      enh_path = p[:enh] || ""
       ts = stem[0,15].gsub(/^(\d{8})_(\d{6})/, '\1 \2')
-      "<div class='item' onclick=\"loadHistoryItem(#{raw_url.to_json}, #{enh_url == 'null' ? 'null' : enh_url.to_json})\">" +
-      "<img src=\"file://#{thumb.gsub('\\','/')}\"><span class='ts'>#{ts}</span></div>"
+      url_args = "#{raw_url.to_json}, #{enh_url ? enh_url.to_json : 'null'}, #{raw_path.to_json}, #{enh_path.to_json}"
+      "<div class='item'>" \
+      "<img src=\"file://#{thumb.gsub('\\','/')}\" onclick=\"loadHistoryItem(#{url_args})\" title=\"Click thumbnail to preview\">" \
+      "<span class='ts' onclick=\"loadHistoryItem(#{url_args})\">#{ts}</span>" \
+      "<button class='small' onclick=\"openImage(#{(enh_path.empty? ? raw_path : enh_path).to_json})\" title='Open full size'>↗</button>" \
+      "</div>"
     end.join("\n")
   end
 
@@ -392,9 +453,17 @@ module SuGptRender
     @tray.add_action_callback("render") do |_, opts_json|
       begin
         opts = JSON.parse(opts_json)
-        do_render_async(opts["width"].to_i, opts["height"].to_i)
+        do_render_async(opts["width"].to_i, opts["height"].to_i, opts["model"].to_s)
       rescue => e
         push_status("Failed: #{e.message}", "err")
+      end
+    end
+    @tray.add_action_callback("set_model") do |_, model_id|
+      cfg = load_config; cfg["model"] = model_id.to_s; save_config(cfg)
+    end
+    @tray.add_action_callback("open_file") do |_, path|
+      if path && !path.to_s.empty? && File.exist?(path)
+        UI.openURL("file://" + path.to_s.gsub("\\", "/"))
       end
     end
     @tray.add_action_callback("edit_prompt")     { |_, _| edit_prompt }
@@ -428,7 +497,7 @@ module SuGptRender
     return unless @tray && @tray.visible?
     raw_url = raw_path ? "file://" + raw_path.gsub("\\", "/") : nil
     enh_url = enh_path ? "file://" + enh_path.gsub("\\", "/") : nil
-    @tray.execute_script("setPreview(#{raw_url.to_json}, #{enh_url.to_json})")
+    @tray.execute_script("setPreview(#{raw_url.to_json}, #{enh_url.to_json}, #{(raw_path||'').to_json}, #{(enh_path||'').to_json})")
   end
 
   def self.push_history
@@ -438,7 +507,7 @@ module SuGptRender
   end
 
   # ------ async render -------------------------------------------------------
-  def self.do_render_async(width, height)
+  def self.do_render_async(width, height, model = nil)
     api_key = get_api_key
     return unless api_key
 
@@ -449,7 +518,8 @@ module SuGptRender
 
     cfg = load_config
     prompt = cfg["prompt"] || DEFAULT_PROMPT
-    cfg["width"] = width; cfg["height"] = height; save_config(cfg)
+    model = (model && !model.empty?) ? model : (cfg["model"] || IMAGE_MODELS.first[0])
+    cfg["width"] = width; cfg["height"] = height; cfg["model"] = model; save_config(cfg)
 
     push_busy(true)
     push_status("Exporting view...", "busy")
@@ -464,12 +534,12 @@ module SuGptRender
       return
     end
 
-    push_status("Calling Poe GPT-Image-2 (~30-60s)...", "busy")
+    push_status("Calling Poe (#{model}) ~30-60s...", "busy")
 
     # Background HTTP — Net::HTTP releases GIL during I/O so this DOES run async.
     @bg_thread = Thread.new do
       begin
-        url = call_poe(api_key, raw_path, prompt)
+        url = call_poe(api_key, raw_path, prompt, model)
         out_path = raw_path.sub(/_raw\.png$/, "_enhanced.png")
         download(url, out_path)
         Thread.current[:result] = { ok: true, raw: raw_path, enh: out_path }
