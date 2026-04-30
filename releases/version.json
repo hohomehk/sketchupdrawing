@@ -1,0 +1,5 @@
+{
+  "version": "0.2.0",
+  "rb_url": "https://raw.githubusercontent.com/hohomehk/sketchupdrawing/main/sketchup_plugin/su_gpt_render/su_gpt_render.rb",
+  "notes": "v0.2 — V-Ray-style tray with async render (non-blocking), result preview, history, auto-update check"
+}

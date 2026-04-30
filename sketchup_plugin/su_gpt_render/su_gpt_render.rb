@@ -11,7 +11,7 @@ require 'cgi'
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.2.0"
+  PLUGIN_VERSION = "0.2.1"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -125,8 +125,11 @@ module SuGptRender
     end
     body = JSON.parse(res.body)
     content = body.dig("choices", 0, "message", "content").to_s
-    m = content.match(/\(([^)]+\.(?:png|jpg|jpeg|webp))[^)]*\)/i) ||
-        content.match(/(https?:\/\/\S+\.(?:png|jpg|jpeg|webp))/i)
+    # Poe returns markdown image: ![alt text](https://pfst.cf2.poecdn.net/.../hash?w=...&h=...)
+    # The URL is hash-based with NO file extension. Match the markdown image syntax
+    # and the parenthesized URL directly.
+    m = content.match(/!\[[^\]]*\]\(([^)\s]+)\)/) ||             # markdown image syntax
+        content.match(/(https?:\/\/[^\s)\]]+)/)                  # any bare URL fallback
     raise "No image URL in response: #{content[0,300]}" unless m
     m[1]
   end
