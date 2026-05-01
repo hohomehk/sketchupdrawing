@@ -1,0 +1,21 @@
+name = "hohome-gemini-proxy"
+main = "src/worker.js"
+compatibility_date = "2026-04-01"
+
+# Smart Placement — run Worker close to upstream (Google) instead of close to client.
+# Critical: HK clients route to HKG colo, where Google geo-blocks Gemini API.
+# Smart Placement should re-route the upstream fetch through a non-HKG datacenter.
+[placement]
+mode = "smart"
+
+# Free tier 預設已經夠用：100k req/day, WebSocket duration 唔計 CPU。
+# 如果 Live API session 大量並行 → 升 Workers Paid (US$5/mo, 10M req/mo)。
+
+# 兩個 secret 經 `wrangler secret put` 設定，唔好寫死喺度：
+#   wrangler secret put GEMINI_API_KEY
+#   wrangler secret put RELAY_SECRET
+#
+# 如果想加 IP allow-list / rate-limit，可以再加 KV namespace。
+
+[observability]
+enabled = true

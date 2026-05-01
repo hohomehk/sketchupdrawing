@@ -545,7 +545,11 @@ class TestAiWatch < Minitest::Test
 
   def test_watch_models_constant
     assert SuGptRender::WATCH_MODELS.length >= 5
-    assert_equal "Gemini-2.5-Flash", SuGptRender::WATCH_MODELS.first[0]
+    # v0.4.0: first entry is now the AI-Gateway direct option (no Poe markup).
+    assert_equal SuGptRender::GEMINI_DIRECT_ID, SuGptRender::WATCH_MODELS.first[0]
+    # Poe-routed Gemini-2.5-Flash still exists as a fallback option.
+    ids = SuGptRender::WATCH_MODELS.map { |x| x[0] }
+    assert_includes ids, "Gemini-2.5-Flash"
   end
 
   def test_default_watch_prompt_present
@@ -559,9 +563,22 @@ class TestAiWatch < Minitest::Test
   end
 
   def test_start_watching_skipped_without_api_key
-    SuGptRender.save_config({})  # no poe_api_key
+    # v0.4.0: skipping logic is per-model. Poe-routed models still need a
+    # Poe key. Direct-via-AI-Gateway needs none (tokens bundled).
+    SuGptRender.save_config({"watch_model" => "Gemini-2.5-Flash"})  # Poe-routed, no key
     SuGptRender.start_watching
-    refute SuGptRender.instance_variable_get(:@aiwatch)[:enabled]
+    refute SuGptRender.instance_variable_get(:@aiwatch)[:enabled],
+      "Poe-routed model without Poe API key should NOT start watching"
+  end
+
+  def test_start_watching_direct_works_without_poe_key
+    # The direct-via-AI-Gateway path bundles its own tokens, so it must
+    # work even when no Poe key is configured.
+    SuGptRender.save_config({"watch_model" => SuGptRender::GEMINI_DIRECT_ID})
+    SuGptRender.start_watching
+    assert SuGptRender.instance_variable_get(:@aiwatch)[:enabled],
+      "Direct-via-AI-Gateway should start watching without a Poe key"
+    SuGptRender.stop_watching
   end
 
   def test_stop_watching_clears
@@ -693,5 +710,334 @@ class TestImageModelList < Minitest::Test
     refute_includes ids, "Nano-Banana-2"
     refute_includes ids, "DALL-E-3"
     refute_includes ids, "Imagen-4"
+  end
+end
+
+# ============================================================================
+# v0.4.0 — Cloudflare AI Gateway + Live Stream
+# ============================================================================
+
+class TestAiGatewayConstants < Minitest::Test
+  def test_constants_present
+    assert SuGptRender::GEMINI_AIG_URL.start_with?("https://gateway.ai.cloudflare.com/v1/"),
+      "AI Gateway URL points at gateway.ai.cloudflare.com"
+    assert SuGptRender::GEMINI_AIG_URL.include?("/google-ai-studio/v1"),
+      "URL includes the google-ai-studio sub-path"
+    assert SuGptRender::GEMINI_AIG_TOKEN.start_with?("cfut_"),
+      "CF AI Gateway tokens start with cfut_"
+    assert SuGptRender::GEMINI_API_KEY.start_with?("AIza"),
+      "Google API keys start with AIza"
+  end
+
+  def test_aig_headers_have_both_auth
+    h = SuGptRender.gemini_aig_headers
+    assert_equal "Bearer #{SuGptRender::GEMINI_AIG_TOKEN}", h["cf-aig-authorization"]
+    assert_equal SuGptRender::GEMINI_API_KEY, h["x-goog-api-key"]
+    assert_equal "application/json", h["Content-Type"]
+  end
+
+  def test_watch_dropdown_includes_direct_option
+    ids = SuGptRender::WATCH_MODELS.map { |x| x[0] }
+    assert_includes ids, SuGptRender::GEMINI_DIRECT_ID
+    # The label should make it obvious which one is the direct path.
+    direct_entry = SuGptRender::WATCH_MODELS.find { |x| x[0] == SuGptRender::GEMINI_DIRECT_ID }
+    refute_nil direct_entry
+    assert direct_entry[1].downcase.include?("direct") || direct_entry[1].downcase.include?("ai gateway"),
+      "label hints at direct/AI-Gateway path: #{direct_entry[1]}"
+  end
+
+  def test_watch_dropdown_in_tray_html
+    # Make sure tray HTML actually renders both Poe-routed and direct entries.
+    Sketchup.reset_model!
+    html = SuGptRender.tray_html
+    assert html.include?(SuGptRender::GEMINI_DIRECT_ID),
+      "tray HTML contains the direct-via-AI-Gateway option id"
+    assert html.include?("Gemini-2.5-Flash"),
+      "tray HTML still contains Poe-routed Gemini option"
+  end
+end
+
+class TestGeminiDirectRequest < Minitest::Test
+  def setup
+    SuGptRender.stub_responses = nil
+    SuGptRender.stub_calls = []
+    @tmpimg = Tempfile.new(["gemini", ".jpg"])
+    @tmpimg.binmode; @tmpimg.write("\xff\xd8\xff" + "x" * 200); @tmpimg.close
+  end
+
+  def teardown
+    @tmpimg.unlink if @tmpimg
+  end
+
+  def test_call_gemini_direct_request_shape_and_url
+    response = JSON.generate({
+      "candidates" => [{
+        "content" => { "parts" => [{ "text" => "I see a kitchen cabinet." }] },
+        "finishReason" => "STOP"
+      }]
+    })
+    SuGptRender.stub_responses = { "*" => FakeHttpResponse.new(200, response) }
+    text = SuGptRender.call_gemini_direct(@tmpimg.path, "Describe.",
+                                          model: "gemini-2.5-flash")
+    assert_equal "I see a kitchen cabinet.", text
+
+    # Verify the POST went to the AI Gateway URL with the right path.
+    posts = SuGptRender.stub_calls.select { |c| c[0] == :post }
+    assert_equal 1, posts.length
+    posted_url = posts.first[1]
+    assert posted_url.start_with?(SuGptRender::GEMINI_AIG_URL),
+      "URL prefix is the AI Gateway base"
+    assert posted_url.include?("/models/gemini-2.5-flash:generateContent"),
+      "URL includes the right model + action: #{posted_url}"
+
+    # Verify the body shape — inlineData + text parts.
+    payload = JSON.parse(posts.first[2])
+    parts = payload.dig("contents", 0, "parts")
+    assert_equal 2, parts.length, "two parts: inline data + text"
+    assert parts[0]["inlineData"], "first part is inlineData"
+    assert_equal "image/jpeg", parts[0]["inlineData"]["mimeType"]
+    refute parts[0]["inlineData"]["data"].empty?, "base64 image data present"
+    assert_equal "Describe.", parts[1]["text"]
+  end
+
+  def test_call_gemini_direct_raises_on_http_error
+    SuGptRender.stub_responses = {
+      "*" => FakeHttpResponse.new(400, '{"error":{"message":"User location is not supported"}}')
+    }
+    err = assert_raises(RuntimeError) {
+      SuGptRender.call_gemini_direct(@tmpimg.path, "p")
+    }
+    assert err.message.include?("HTTP 400")
+    # Sanity: even when CF AI Gateway returns Gemini's error verbatim, we
+    # surface it cleanly.
+    assert err.message.include?("location"), "error body forwarded"
+  end
+
+  def test_build_gemini_payload_uses_inline_data
+    payload = SuGptRender.build_gemini_payload(@tmpimg.path, "hi", mime_type: "image/png")
+    parts = payload["contents"][0]["parts"]
+    assert_equal "image/png", parts[0]["inlineData"]["mimeType"]
+    # Base64 of our test bytes
+    expected = Base64.strict_encode64(File.binread(@tmpimg.path))
+    assert_equal expected, parts[0]["inlineData"]["data"]
+    assert_equal "hi", parts[1]["text"]
+  end
+end
+
+class TestSseParser < Minitest::Test
+  # Helper: collect [kind, payload] events from parse_sse_chunks.
+  def parse(buffer)
+    events = []
+    remaining, _done = SuGptRender.parse_sse_chunks(buffer.dup) do |kind, data|
+      events << [kind, data]
+    end
+    [events, remaining]
+  end
+
+  def test_single_event
+    buf = %(data: {"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}\n\n)
+    events, remaining = parse(buf)
+    assert_equal 1, events.length
+    assert_equal :event, events.first[0]
+    assert_equal "hi", events.first[1].dig("candidates", 0, "content", "parts", 0, "text")
+    assert_equal "", remaining, "fully consumed"
+  end
+
+  def test_multiple_events_in_one_buffer
+    buf = %(data: {"candidates":[{"content":{"parts":[{"text":"first"}]}}]}\n) +
+          %(\n) +
+          %(data: {"candidates":[{"content":{"parts":[{"text":"second"}]}}]}\n\n)
+    events, remaining = parse(buf)
+    assert_equal 2, events.length
+    assert_equal "first",  SuGptRender.gemini_extract_delta(events[0][1])
+    assert_equal "second", SuGptRender.gemini_extract_delta(events[1][1])
+    assert_equal "", remaining
+  end
+
+  def test_keepalive_comment_ignored
+    buf = ": keepalive\n\n" +
+          %(data: {"candidates":[{"content":{"parts":[{"text":"x"}]}}]}\n\n)
+    events, _r = parse(buf)
+    # Comment-only event is dropped silently; only the real event surfaces.
+    assert_equal 1, events.length
+    assert_equal "x", SuGptRender.gemini_extract_delta(events.first[1])
+  end
+
+  def test_partial_json_left_in_buffer
+    # The closing `\n\n` is missing → the parser should NOT yield, and the
+    # bytes must be returned in the remaining buffer for the next chunk.
+    buf = %(data: {"candidates":[{"content":{"parts":[{"text":"par)
+    events, remaining = parse(buf)
+    assert_empty events, "no event yet — JSON not terminated"
+    assert_equal buf, remaining, "all bytes preserved for next chunk"
+  end
+
+  def test_two_chunks_glued
+    chunk1 = %(data: {"candidates":[{"content":{"parts":[{"text":"hel)
+    chunk2 = %(lo"}]}}]}\n\n)
+    # Simulate the caller's buffer-carry-over pattern.
+    events1 = []
+    rem, _ = SuGptRender.parse_sse_chunks(chunk1.dup) { |k, d| events1 << [k, d] }
+    assert_empty events1
+    # Now glue chunk2 onto the carry-over and parse again.
+    events2 = []
+    rem2, _ = SuGptRender.parse_sse_chunks(rem + chunk2) { |k, d| events2 << [k, d] }
+    assert_equal 1, events2.length
+    assert_equal "hello", SuGptRender.gemini_extract_delta(events2.first[1])
+    assert_equal "", rem2
+  end
+
+  def test_finish_reason_stop_yields_done
+    buf = %(data: {"candidates":[{"finishReason":"STOP"}]}\n\n)
+    events, _r = parse(buf)
+    kinds = events.map { |e| e[0] }
+    assert_includes kinds, :event
+    assert_includes kinds, :done, ":done emitted on finishReason STOP"
+  end
+
+  def test_done_sentinel
+    buf = "data: [DONE]\n\n"
+    events, _r = parse(buf)
+    assert_equal [[:done, nil]], events
+  end
+
+  def test_crlf_line_endings_handled
+    buf = %(data: {"candidates":[{"content":{"parts":[{"text":"win"}]}}]}\r\n\r\n)
+    events, _r = parse(buf)
+    assert_equal 1, events.length
+    assert_equal "win", SuGptRender.gemini_extract_delta(events.first[1])
+  end
+
+  def test_multi_line_data_in_one_event
+    # SSE allows a single event to have multiple `data:` lines; the spec says
+    # they're joined with \n. We don't expect Gemini to do this but we
+    # tolerate it.
+    buf = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\n" +
+          "data: \"hi\"\n" +
+          "data: }]}}]}\n\n"
+    events, _r = parse(buf)
+    # If JSON.parse on the joined string succeeds, we yield. If not, we drop
+    # — either way no crash. Just assert no exception was raised.
+    assert events.length >= 0
+  end
+
+  def test_extract_delta_empty_when_no_parts
+    assert_equal "", SuGptRender.gemini_extract_delta({})
+    assert_equal "", SuGptRender.gemini_extract_delta({"candidates" => [{}]})
+  end
+end
+
+class TestLiveStreamCost < Minitest::Test
+  def setup
+    File.delete(TEST_CFG_PATH) if File.exist?(TEST_CFG_PATH)
+  end
+
+  def test_live_count_starts_at_zero
+    assert_equal 0, SuGptRender.live_count_today
+    assert_equal 0.0, SuGptRender.live_cost_today
+  end
+
+  def test_live_count_bump_persists
+    3.times { SuGptRender.bump_live_count }
+    assert_equal 3, SuGptRender.live_count_today
+  end
+
+  def test_live_cost_inside_free_tier
+    # 100 streams << 1500 RPD → still on the free tier.
+    100.times { SuGptRender.bump_live_count }
+    assert_equal 0.0, SuGptRender.live_cost_today,
+      "Gemini 2.5 Flash free tier covers up to 1500 requests/day"
+  end
+
+  def test_live_cost_above_free_tier
+    cfg = SuGptRender.load_config
+    cfg["live_counts"] = { Time.now.strftime("%Y-%m-%d") => 1600 }
+    SuGptRender.save_config(cfg)
+    # 1600 * 0.0001 = 0.16 (rough, just checking the meter triggers).
+    assert SuGptRender.live_cost_today > 0.0,
+      "above 1500 RPD the meter starts charging"
+  end
+
+  def test_direct_watch_model_has_cost_entry
+    assert SuGptRender::WATCH_COST_PER_CALL.key?(SuGptRender::GEMINI_DIRECT_ID),
+      "cost meter knows about the direct model"
+    SuGptRender.save_config({"watch_model" => SuGptRender::GEMINI_DIRECT_ID})
+    SuGptRender.bump_watch_count
+    cost = SuGptRender.estimated_cost_today
+    assert cost >= 0.0
+    # Direct path should be cheaper than Poe-routed Gemini (no markup).
+    poe_rate    = SuGptRender::WATCH_COST_PER_CALL["Gemini-2.5-Flash"]
+    direct_rate = SuGptRender::WATCH_COST_PER_CALL[SuGptRender::GEMINI_DIRECT_ID]
+    assert direct_rate < poe_rate,
+      "direct rate (#{direct_rate}) cheaper than Poe-routed (#{poe_rate})"
+  end
+end
+
+class TestLiveStreamLifecycle < Minitest::Test
+  def setup
+    File.delete(TEST_CFG_PATH) if File.exist?(TEST_CFG_PATH)
+    Sketchup.reset_model!
+    SuGptRender.instance_variable_set(:@livestream, {
+      enabled:      false,
+      stop_flag:    false,
+      bg_thread:    nil,
+      poll_timer:   nil,
+      tick_timer:   nil,
+      queue:        nil,
+      current_text: "",
+      in_flight:    false,
+    })
+    SuGptRender.instance_variable_set(:@tray, nil)
+    UI.reset!
+  end
+
+  def test_start_live_stream_flips_flag
+    SuGptRender.start_live_stream
+    assert SuGptRender.instance_variable_get(:@livestream)[:enabled]
+    SuGptRender.stop_live_stream
+    refute SuGptRender.instance_variable_get(:@livestream)[:enabled]
+  end
+
+  def test_toggle_live_stream
+    SuGptRender.toggle_live_stream
+    assert SuGptRender.instance_variable_get(:@livestream)[:enabled]
+    SuGptRender.toggle_live_stream
+    refute SuGptRender.instance_variable_get(:@livestream)[:enabled]
+  end
+
+  def test_stop_clears_timers
+    SuGptRender.start_live_stream
+    refute_empty UI.timers
+    SuGptRender.stop_live_stream
+    # poll/tick timers should be removed; we don't enforce zero (other code
+    # may have started timers) but the live ones must be gone.
+    ls = SuGptRender.instance_variable_get(:@livestream)
+    assert_nil ls[:poll_timer]
+    assert_nil ls[:tick_timer]
+  end
+
+  def test_tray_html_includes_live_tab
+    Sketchup.reset_model!
+    html = SuGptRender.tray_html
+    assert html.include?("Live Stream"),  "tab label rendered"
+    assert html.include?("live_pane"),    "pane element rendered"
+    assert html.include?("toggleLive"),   "JS handler wired"
+    assert html.include?("Frame interval"), "interval selector visible"
+    assert html.include?("JPEG quality"), "quality selector visible"
+  end
+end
+
+class TestVersionBump < Minitest::Test
+  def test_plugin_version_is_0_4_0
+    assert_equal "0.4.0", SuGptRender::PLUGIN_VERSION
+  end
+
+  def test_version_json_matches
+    path = File.expand_path("../sketchup_plugin/version.json", __dir__)
+    data = JSON.parse(File.read(path))
+    assert_equal "0.4.0", data["version"]
+    assert data["notes"].downcase.include?("ai gateway") ||
+           data["notes"].downcase.include?("live stream"),
+      "release notes mention AI Gateway / Live Stream"
   end
 end

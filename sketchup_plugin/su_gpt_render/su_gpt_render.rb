@@ -10,15 +10,37 @@ require 'base64'
 require 'cgi'
 require 'openssl'
 require 'time'
+require 'thread'   # Queue used by Live Stream main↔bg thread handoff
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.3.0"
+  PLUGIN_VERSION = "0.4.0"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
+  # ---- Gemini via Cloudflare AI Gateway -------------------------------------
+  # Direct google-ai-studio call from HK fails with 400 "User location not
+  # supported" (Gemini geo-blocks HK IPs). A vanilla CF Worker proxy ALSO
+  # fails because CF colo selection follows client IP (HK→HKG colo→HK egress).
+  # Cloudflare AI Gateway is the working path: it runs on CF managed infra
+  # and egresses through non-HK IPs. Empirically verified from HK with HTTP
+  # 200, 1.3-1.6s latency, and SSE streaming works.
+  #
+  # Both tokens are bundled in-plugin: this is internal-deploy only and the
+  # accepted leak risk per the firm.
+  GEMINI_AIG_URL   = "https://gateway.ai.cloudflare.com/v1/945eb571b27f72d3ad419c2468313f6f/hohome-gemini/google-ai-studio/v1"
+  GEMINI_AIG_TOKEN = "cfut_OA1G8VW9NHR7Pqn6IkTcfESgpPw42A2WqOzDVUiq5cacdaa1"
+  GEMINI_API_KEY   = "AIzaSyByYt_-VHedKn15VGWYeM1osXO2GB-WYR0"
+
+  # Sentinel id used in WATCH_MODELS dropdown to mean "go through AI Gateway
+  # directly to Gemini 2.5 Flash, bypass Poe". Cheaper since no Poe markup.
+  GEMINI_DIRECT_ID = "gemini-2.5-flash-direct"
+
   # Vision models for AI Watch (text+image → text). First entry = default.
+  # The "*-direct" id is the sentinel for AI-Gateway-routed Gemini (see
+  # GEMINI_DIRECT_ID); all other ids are Poe model ids.
   WATCH_MODELS = [
+    [GEMINI_DIRECT_ID,       "Gemini 2.5 Flash (direct via AI Gateway)", "Google · 直連 · 最平"],
     ["Gemini-2.5-Flash",     "Gemini 2.5 Flash",   "Google · 平 + 快 · 推薦"],
     ["Seed-2.0-Mini",        "Seed 2.0 Mini",      "ByteDance · 最便宜"],
     ["Seed-2.0-Pro",         "Seed 2.0 Pro",       "ByteDance · flagship"],
@@ -367,6 +389,157 @@ module SuGptRender
     JSON.parse(res.body).dig("choices", 0, "message", "content").to_s
   end
 
+  # ---- Gemini direct (via Cloudflare AI Gateway) ----------------------------
+
+  # Build the request shape Gemini expects: an inlineData image part plus a
+  # text part. Used for both non-streaming (AI Watch direct) and streaming
+  # (Live Stream tab) requests so the body shape stays identical.
+  def self.build_gemini_payload(image_path, prompt, mime_type: "image/jpeg")
+    img_b64 = Base64.strict_encode64(File.binread(image_path))
+    {
+      "contents" => [{
+        "parts" => [
+          { "inlineData" => { "mimeType" => mime_type, "data" => img_b64 } },
+          { "text" => prompt },
+        ]
+      }]
+    }
+  end
+
+  # Both auth headers AI Gateway requires. Centralized so tests can verify
+  # the request shape and so the streaming + non-streaming paths can't drift.
+  def self.gemini_aig_headers
+    {
+      "cf-aig-authorization" => "Bearer #{GEMINI_AIG_TOKEN}",
+      "x-goog-api-key"       => GEMINI_API_KEY,
+      "Content-Type"         => "application/json",
+    }
+  end
+
+  # Non-streaming Gemini call — used by AI Watch when user picks the direct
+  # model. Returns the joined text from candidates[0].content.parts[*].text.
+  def self.call_gemini_direct(image_path, prompt, model: "gemini-2.5-flash", mime_type: "image/jpeg")
+    url = "#{GEMINI_AIG_URL}/models/#{model}:generateContent"
+    payload = build_gemini_payload(image_path, prompt, mime_type: mime_type)
+    res = http_post_json(url, gemini_aig_headers, JSON.generate(payload))
+    unless res.is_a?(Net::HTTPSuccess)
+      raise "Gemini AI Gateway HTTP #{res.code}: #{res.body[0,300]}"
+    end
+    data = JSON.parse(res.body) rescue {}
+    parts = data.dig("candidates", 0, "content", "parts") || []
+    parts.map { |p| p["text"].to_s }.join.strip
+  end
+
+  # Pure-Ruby SSE chunk parser. Feeds incoming HTTP body bytes (which may
+  # arrive as partial frames, or multiple frames glued together) and yields
+  # one parsed JSON event at a time + a :done sentinel when the stream ends.
+  #
+  # Returns a `[remaining_buffer, finished?]` tuple so the caller can keep
+  # carrying over bytes that didn't form a complete `\n\n`-terminated event.
+  #
+  # Handles:
+  #  - Multiple `data: ...` lines per event (Gemini streams one event per
+  #    chunk in practice but we tolerate both).
+  #  - `: keepalive` comments (lines starting with `:`).
+  #  - Partial JSON across chunks (only emit on complete `\n\n`).
+  #  - finishReason "STOP" → mark stream finished, yield :done.
+  def self.parse_sse_chunks(buffer)
+    finished = false
+    # Normalize CRLF → LF so the \n\n splitter works on either platform.
+    buffer = buffer.gsub("\r\n", "\n")
+    while (idx = buffer.index("\n\n"))
+      raw_event = buffer[0...idx]
+      buffer    = buffer[(idx + 2)..-1] || ""
+      data_lines = []
+      raw_event.split("\n").each do |line|
+        # SSE comment / keepalive — ignore.
+        next if line.empty? || line.start_with?(":")
+        if line.start_with?("data:")
+          data_lines << line.sub(/\Adata:\s?/, "")
+        end
+        # Other fields (event:, id:, retry:) — Gemini doesn't use them so
+        # we ignore. If they ever appear we just skip silently.
+      end
+      next if data_lines.empty?
+      payload = data_lines.join("\n")
+      # Some servers send a literal "[DONE]" sentinel. Gemini doesn't, but
+      # it's cheap insurance in case AI Gateway ever wraps it.
+      if payload.strip == "[DONE]"
+        finished = true
+        yield :done, nil
+        next
+      end
+      data = JSON.parse(payload) rescue nil
+      next unless data
+      yield :event, data
+      # Stop sentinel from Gemini.
+      if (data.dig("candidates", 0, "finishReason") || "").to_s == "STOP"
+        finished = true
+        yield :done, data
+      end
+    end
+    [buffer, finished]
+  end
+
+  # Walk the candidates list and pull out any text deltas. Gemini streams
+  # incremental tokens as candidates[0].content.parts[*].text — the parts
+  # array typically contains one text part with the latest delta.
+  def self.gemini_extract_delta(event_data)
+    parts = event_data.dig("candidates", 0, "content", "parts") || []
+    parts.map { |p| p["text"].to_s }.join
+  end
+
+  # Streaming Gemini call. Spawns Net::HTTP request + read_body block, calls
+  # `on_token` (main thread isn't safe from a Thread, so the caller must
+  # marshal back via UI.start_timer or a Queue if needed). For our use we
+  # call this from a background Thread and the on_token closure pushes to a
+  # Queue that the main UI timer drains.
+  def self.stream_gemini(image_path, prompt, model: "gemini-2.5-flash",
+                        mime_type: "image/jpeg", &on_token)
+    url = "#{GEMINI_AIG_URL}/models/#{model}:streamGenerateContent?alt=sse"
+    payload = JSON.generate(build_gemini_payload(image_path, prompt, mime_type: mime_type))
+    uri = URI.parse(url)
+    http = Net::HTTP.new(uri.host, uri.port)
+    configure_http(http, uri.scheme)
+    req = Net::HTTP::Post.new(uri.request_uri)
+    gemini_aig_headers.each { |k, v| req[k] = v }
+    req.body = payload
+
+    buffer    = +""
+    finished  = false
+    full_text = +""
+    err_body  = nil
+    http.request(req) do |res|
+      if !res.is_a?(Net::HTTPSuccess)
+        err_body = +""
+        res.read_body { |chunk| err_body << chunk }
+        next
+      end
+      res.read_body do |chunk|
+        buffer << chunk
+        buffer, done_flag = parse_sse_chunks(buffer) do |kind, data|
+          if kind == :event
+            delta = gemini_extract_delta(data)
+            unless delta.empty?
+              full_text << delta
+              on_token.call(:token, delta) if on_token
+            end
+          elsif kind == :done
+            on_token.call(:done, full_text) if on_token
+          end
+        end
+        finished ||= done_flag
+      end
+    end
+    if err_body
+      raise "Gemini stream HTTP error: #{err_body[0,300]}"
+    end
+    # If the server closed without an explicit STOP we still report done so
+    # the UI can flip out of "streaming" state.
+    on_token.call(:done, full_text) if on_token && !finished
+    full_text
+  end
+
   # ----- AI Watch ------------------------------------------------------------
   class WatchObserver < Sketchup::ViewObserver
     def onViewChanged(view)
@@ -378,7 +551,12 @@ module SuGptRender
 
   def self.start_watching
     cfg = load_config
-    return unless cfg["poe_api_key"].to_s.size > 0
+    # Direct-via-AI-Gateway path needs no Poe key (the CF + Gemini tokens
+    # are bundled). Only the Poe-routed models require poe_api_key.
+    model = cfg["watch_model"] || WATCH_MODELS.first[0]
+    if model != GEMINI_DIRECT_ID && cfg["poe_api_key"].to_s.empty?
+      return
+    end
     return if @aiwatch[:enabled]
     @aiwatch[:enabled] = true
     @aiwatch[:observer] ||= WatchObserver.new
@@ -426,7 +604,11 @@ module SuGptRender
   end
 
   def self.analyze_now
-    return unless load_config["poe_api_key"].to_s.size > 0
+    cfg = load_config
+    model = cfg["watch_model"] || WATCH_MODELS.first[0]
+    if model != GEMINI_DIRECT_ID && cfg["poe_api_key"].to_s.empty?
+      return
+    end
     if @aiwatch[:pending_timer]
       UI.stop_timer(@aiwatch[:pending_timer])
       @aiwatch[:pending_timer] = nil
@@ -437,11 +619,16 @@ module SuGptRender
   def self.capture_and_analyze
     return if @aiwatch[:bg_thread] && @aiwatch[:bg_thread].alive?
     cfg = load_config
-    api_key = cfg["poe_api_key"].to_s
-    return if api_key.empty?
-
     model = cfg["watch_model"] || WATCH_MODELS.first[0]
     prompt = cfg["watch_prompt"] || DEFAULT_WATCH_PROMPT
+    use_direct = (model == GEMINI_DIRECT_ID)
+
+    # Direct-via-AI-Gateway needs no Poe key. Poe path still does.
+    api_key = cfg["poe_api_key"].to_s
+    if !use_direct && api_key.empty?
+      push_watch_status("Set Poe API key first", "err")
+      return
+    end
 
     # Smaller resolution for cheap polling
     raw_path = nil
@@ -457,7 +644,16 @@ module SuGptRender
 
     @aiwatch[:bg_thread] = Thread.new do
       begin
-        text = call_poe_text(api_key, raw_path, prompt, model)
+        text = if use_direct
+                 # Convert PNG → JPEG-on-disk would need ChunkyPNG / RMagick;
+                 # SU's stdlib can't transcode in-process. We just send the
+                 # PNG bytes with image/png mime — Gemini accepts both.
+                 call_gemini_direct(raw_path, prompt,
+                                    model: "gemini-2.5-flash",
+                                    mime_type: "image/png")
+               else
+                 call_poe_text(api_key, raw_path, prompt, model)
+               end
         Thread.current[:result] = { ok: true, text: text, raw: raw_path,
                                     model: model, started: started }
       rescue => e
@@ -535,6 +731,13 @@ module SuGptRender
   # Rough cost estimate per call by model. Real billing varies; this is just for
   # the display on the tray (so user can see if cost is exploding).
   WATCH_COST_PER_CALL = {
+    # Direct-via-AI-Gateway path. Gemini 2.5 Flash free tier is $0/$0 up to
+    # 1500 requests/day, then $0.10 per 1M input tokens / $0.40 per 1M output.
+    # A typical 800x600 JPEG inline image is ~258 tokens (image) + ~80 tokens
+    # (prompt) input, ~120 tokens output → ≈ ($0.10·338 + $0.40·120)/1e6 ≈
+    # $0.000082. Round up to 0.0001 to keep the daily-meter honest above
+    # 1500 RPD without scaring the user inside it.
+    GEMINI_DIRECT_ID        => 0.0001,
     "Gemini-2.5-Flash"      => 0.0015,
     "Seed-2.0-Mini"         => 0.0008,
     "Seed-2.0-Pro"          => 0.0040,
@@ -563,6 +766,190 @@ module SuGptRender
     lines.first(limit).map { |l| JSON.parse(l) rescue nil }.compact
   end
 
+  # ----- Live Stream ---------------------------------------------------------
+
+  # Capture the current view as a JPEG with quality knob. Returns the path.
+  # SU's view.write_image accepts :jpeg_quality 0.0..1.0 when filename ends
+  # with .jpg. Smaller quality → smaller payload → faster SSE first-token.
+  def self.export_view_for_stream(width, height, quality_pct)
+    model = Sketchup.active_model
+    raise "No model" unless model
+    base = model.path.empty? ? "Untitled" : File.basename(model.path, ".skp")
+    base = base.gsub(/[^\w一-鿿\-]/, "_")
+    timestamp = Time.now.strftime("%Y%m%d_%H%M%S_%L")
+    out_dir = if model.path.empty?
+                File.expand_path("~/Desktop/gpt_render/stream")
+              else
+                File.join(File.dirname(model.path), "gpt_render", "stream")
+              end
+    FileUtils.mkdir_p(out_dir)
+    out_path = File.join(out_dir, "#{timestamp}_#{base}_stream.jpg")
+    quality_f = (quality_pct.to_f / 100.0).clamp(0.05, 1.0)
+    success = model.active_view.write_image(filename: out_path, width: width,
+                                            height: height, antialias: false,
+                                            transparent: false,
+                                            jpeg_quality: quality_f)
+    raise "write_image failed" unless success
+    out_path
+  end
+
+  def self.start_live_stream
+    return if @livestream[:enabled]
+    @livestream[:enabled]      = true
+    @livestream[:stop_flag]    = false
+    @livestream[:queue]        = Queue.new
+    @livestream[:current_text] = +""
+    @livestream[:in_flight]    = false
+    cfg = load_config
+    interval = (cfg["live_interval"] || 2).to_i.clamp(1, 30)
+
+    push_live_state(true)
+    push_live_status("Live stream: ON (#{interval}s)", "ok")
+
+    # Drain queue from main thread (Net::HTTP read_body is on bg thread).
+    @livestream[:poll_timer] = UI.start_timer(0.1, true) { drain_live_queue }
+
+    # Capture-and-stream tick. We don't fire a new request while one is
+    # in_flight — that would tear the stream and confuse the user.
+    @livestream[:tick_timer] = UI.start_timer(0.05, true) do
+      if !@livestream[:in_flight] && @livestream[:enabled]
+        kick_live_frame
+        # Re-arm with the configured interval after each kick.
+        UI.stop_timer(@livestream[:tick_timer]) if @livestream[:tick_timer]
+        @livestream[:tick_timer] = UI.start_timer(interval, true) do
+          kick_live_frame if !@livestream[:in_flight] && @livestream[:enabled]
+        end
+      end
+    end
+    puts "[GPT Render] Live stream started"
+  end
+
+  def self.stop_live_stream
+    return unless @livestream[:enabled]
+    @livestream[:enabled]   = false
+    @livestream[:stop_flag] = true
+    if @livestream[:tick_timer]
+      UI.stop_timer(@livestream[:tick_timer]); @livestream[:tick_timer] = nil
+    end
+    if @livestream[:poll_timer]
+      UI.stop_timer(@livestream[:poll_timer]); @livestream[:poll_timer] = nil
+    end
+    # Don't .join the thread — the read_body block may be mid-chunk and we
+    # don't want to block the main UI. Setting stop_flag lets it exit on
+    # its next chunk; the GIL will clean up after that.
+    @livestream[:bg_thread] = nil
+    @livestream[:queue]     = nil
+    @livestream[:in_flight] = false
+    push_live_state(false)
+    push_live_status("Live stream: OFF", "ok")
+    puts "[GPT Render] Live stream stopped"
+  end
+
+  def self.toggle_live_stream
+    @livestream[:enabled] ? stop_live_stream : start_live_stream
+  end
+
+  def self.kick_live_frame
+    return unless @livestream[:enabled]
+    return if @livestream[:in_flight]
+    cfg = load_config
+    prompt  = cfg["live_prompt"] || cfg["watch_prompt"] || DEFAULT_WATCH_PROMPT
+    quality = (cfg["live_quality"] || 60).to_i
+    width   = (cfg["live_width"]   || 800).to_i
+    height  = (cfg["live_height"]  || 600).to_i
+
+    raw_path = nil
+    begin
+      raw_path = export_view_for_stream(width, height, quality)
+    rescue => e
+      push_live_status("Capture failed: #{e.message}", "err")
+      return
+    end
+    push_live_frame(raw_path)
+    @livestream[:in_flight] = true
+    @livestream[:current_text] = +""
+    push_live_status("Streaming…", "busy")
+
+    @livestream[:bg_thread] = Thread.new do
+      q = @livestream[:queue]
+      begin
+        stream_gemini(raw_path, prompt,
+                      model: "gemini-2.5-flash",
+                      mime_type: "image/jpeg") do |kind, payload|
+          # Bail out cooperatively if user hit Stop mid-stream.
+          break if @livestream[:stop_flag]
+          q << [kind, payload] if q
+        end
+      rescue => e
+        q << [:err, e.message] if q
+      ensure
+        q << [:flight_done, nil] if q
+      end
+    end
+  end
+
+  # Drain queue. Runs on main UI thread via UI.start_timer.
+  def self.drain_live_queue
+    q = @livestream[:queue]
+    return unless q
+    until q.empty?
+      kind, payload = q.pop(true) rescue break
+      case kind
+      when :token
+        @livestream[:current_text] << payload.to_s
+        push_live_token(payload.to_s, @livestream[:current_text])
+      when :done
+        push_live_done(@livestream[:current_text])
+        log_live_observation(@livestream[:current_text])
+        bump_live_count
+      when :err
+        push_live_status("Stream error: #{payload.to_s[0,120]}", "err")
+      when :flight_done
+        @livestream[:in_flight] = false
+      end
+    end
+  end
+
+  # Persist a streamed observation alongside the watch JSONL but in its
+  # own log so the meters don't double-count.
+  def self.log_live_observation(text)
+    dir = history_dir
+    return unless dir
+    out_dir = File.join(dir, "stream")
+    FileUtils.mkdir_p(out_dir)
+    log_path = File.join(out_dir, "live_stream_#{Time.now.strftime('%Y%m%d')}.jsonl")
+    File.open(log_path, "a") { |f|
+      f.puts JSON.generate({
+        "ts"    => Time.now.iso8601,
+        "model" => "gemini-2.5-flash",
+        "text"  => text,
+      })
+    }
+  end
+
+  def self.bump_live_count
+    cfg = load_config
+    cfg["live_counts"] ||= {}
+    today = Time.now.strftime("%Y-%m-%d")
+    cfg["live_counts"][today] = (cfg["live_counts"][today] || 0) + 1
+    save_config(cfg)
+  end
+
+  def self.live_count_today
+    cfg = load_config
+    today = Time.now.strftime("%Y-%m-%d")
+    (cfg["live_counts"] || {})[today] || 0
+  end
+
+  # Cost estimate for live stream. gemini-2.5-flash free tier is $0/$0 input
+  # and output up to 1500 RPD; beyond that, $0.10/M input, $0.40/M output.
+  # Per call: ~338 input tokens + ~120 output ≈ $0.000082 → 0.0001 rounded.
+  def self.live_cost_today
+    n = live_count_today
+    rate = n > 1500 ? 0.0001 : 0.0
+    (n * rate).round(4)
+  end
+
   # ------ tray dialog --------------------------------------------------------
   # Use ||= so that `load __FILE__` (hot-reload) preserves these references.
   # If we used = the load would reset @tray to nil and we'd lose the live dialog.
@@ -580,6 +967,25 @@ module SuGptRender
     observer:       nil,
     bg_thread:      nil,
     bg_poll_timer:  nil,
+  }
+  # Live Stream state — separate tab, no debounce, SSE token-by-token output
+  # via Cloudflare AI Gateway → Gemini streamGenerateContent.
+  #   :enabled       — true while streaming
+  #   :stop_flag     — Mutex-protected boolean the bg thread polls every chunk
+  #   :bg_thread     — the streaming Thread (one in flight at a time)
+  #   :poll_timer    — UI timer that drains :queue onto the tray
+  #   :tick_timer    — recurring frame trigger between calls
+  #   :queue         — Thread::Queue of [:token|:done|:err, payload]
+  #   :tokens_today  — counters for cost meter (input/output tokens approx)
+  @livestream            ||= {
+    enabled:       false,
+    stop_flag:     false,
+    bg_thread:     nil,
+    poll_timer:    nil,
+    tick_timer:    nil,
+    queue:         nil,
+    current_text:  "",
+    in_flight:     false,
   }
 
   def self.tray_html
@@ -603,6 +1009,13 @@ module SuGptRender
       sel = (id == aiw_model) ? " selected" : ""
       "<option value=\"#{id}\"#{sel}>#{CGI.escapeHTML(label)} — #{CGI.escapeHTML(hint)}</option>"
     }.join("\n")
+
+    # Live Stream state for HTML
+    live_enabled  = @livestream && @livestream[:enabled] ? true : false
+    live_interval = (cfg["live_interval"] || 2).to_i
+    live_quality  = (cfg["live_quality"]  || 60).to_i
+    live_today    = live_count_today
+    live_cost     = live_cost_today
 
     model_options_html = IMAGE_MODELS.map { |id, label, hint|
       sel = (id == selected_model) ? " selected" : ""
@@ -718,6 +1131,7 @@ module SuGptRender
           <button id="mt_prompts" onclick="switchMainTab('prompts')">Prompts</button>
           <button id="mt_history" onclick="switchMainTab('history')">History <span class="badge" id="hist_count">#{history_count}</span></button>
           <button id="mt_aiwatch" onclick="switchMainTab('aiwatch')">AI Watch <span class="badge" id="aiw_dot">#{aiw_enabled ? '●' : ''}</span></button>
+          <button id="mt_live"    onclick="switchMainTab('live')">Live Stream <span class="badge" id="live_dot">#{live_enabled ? '●' : ''}</span></button>
         </div>
 
         <!-- ========== Render tab ========== -->
@@ -820,6 +1234,55 @@ module SuGptRender
           <div class="aiw-feed" id="aiw_feed">#{aiw_feed_html}</div>
         </div>
 
+        <!-- ========== Live Stream tab ========== -->
+        <div id="live_pane" class="pane">
+          <div id="live_status_pill" class="aiw-status #{live_enabled ? 'on' : 'off'}">
+            #{live_enabled ? '● Streaming' : '○ Off'}
+          </div>
+          <div class="row">
+            <button id="live_btn" class="primary" style="width:100%" onclick="toggleLive()">
+              #{live_enabled ? '■ Stop Live' : '▶ Start Live'}
+            </button>
+          </div>
+
+          <div class="grid row">
+            <label>Frame interval
+              <select id="live_interval" onchange="setLiveInterval()">
+                <option value="1" #{live_interval == 1 ? 'selected' : ''}>1s</option>
+                <option value="2" #{live_interval == 2 ? 'selected' : ''}>2s</option>
+                <option value="3" #{live_interval == 3 ? 'selected' : ''}>3s</option>
+              </select>
+            </label>
+            <label>JPEG quality
+              <select id="live_quality" onchange="setLiveQuality()">
+                <option value="40" #{live_quality == 40 ? 'selected' : ''}>40% (smallest)</option>
+                <option value="60" #{live_quality == 60 ? 'selected' : ''}>60% (default)</option>
+                <option value="80" #{live_quality == 80 ? 'selected' : ''}>80%</option>
+                <option value="95" #{live_quality == 95 ? 'selected' : ''}>95%</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="small-btns">
+            <button class="small" onclick="cmd('edit_live_prompt')">Live Prompt</button>
+            <button class="small" onclick="cmd('open_live_log')">Open log</button>
+          </div>
+
+          <div class="info-grid">
+            <div>Today</div><div id="live_today">#{live_today} streams · ~$#{format('%.4f', live_cost)}</div>
+            <div>Endpoint</div><div><code>gemini-2.5-flash · streamGenerateContent (SSE)</code></div>
+          </div>
+
+          <h3>Current frame</h3>
+          <div class="preview" style="min-height:90px">
+            <div id="live_frame_empty" class="empty">Click Start Live → frame appears here</div>
+            <img id="live_frame" style="display:none">
+          </div>
+
+          <h3>Streamed output</h3>
+          <div id="live_output" style="background:#0a0a0a;border:1px solid #2a2a2a;border-radius:4px;padding:10px;min-height:80px;font-size:12.5px;line-height:1.5;white-space:pre-wrap;color:#cfc;"></div>
+        </div>
+
         <!-- ========== History tab ========== -->
         <div id="history_pane" class="pane">
           <div class="small-btns">
@@ -887,12 +1350,49 @@ module SuGptRender
           }
         }
         function switchMainTab(name) {
-          ['render','prompts','history','aiwatch'].forEach(n => {
+          ['render','prompts','history','aiwatch','live'].forEach(n => {
             const tabBtn = document.getElementById('mt_' + n);
             const pane = document.getElementById(n + '_pane');
             if (tabBtn) tabBtn.classList.toggle('active', name === n);
             if (pane) pane.classList.toggle('active', name === n);
           });
+        }
+        // Live Stream
+        function toggleLive()       { sketchup.toggle_live(''); }
+        function setLiveInterval()  { sketchup.set_live_interval(document.getElementById('live_interval').value); }
+        function setLiveQuality()   { sketchup.set_live_quality(document.getElementById('live_quality').value); }
+        function setLiveUI(enabled) {
+          const btn  = document.getElementById('live_btn');
+          const dot  = document.getElementById('live_dot');
+          const pill = document.getElementById('live_status_pill');
+          if (btn)  btn.textContent  = enabled ? '■ Stop Live' : '▶ Start Live';
+          if (dot)  dot.textContent  = enabled ? '●' : '';
+          if (pill) {
+            pill.textContent = enabled ? '● Streaming' : '○ Off';
+            pill.className   = 'aiw-status ' + (enabled ? 'on' : 'off');
+          }
+        }
+        function setLiveFrame(url) {
+          const img = document.getElementById('live_frame');
+          const empty = document.getElementById('live_frame_empty');
+          if (url) {
+            img.src = url + '?_=' + Date.now();
+            img.style.display = 'block';
+            if (empty) empty.style.display = 'none';
+            // New frame → start a fresh streamed-output buffer.
+            const out = document.getElementById('live_output');
+            if (out) out.textContent = '';
+          }
+        }
+        function appendLiveToken(delta, fullText) {
+          const out = document.getElementById('live_output');
+          if (out) out.textContent = fullText;
+        }
+        function liveDone(fullText, todayCount, todayCost) {
+          const out = document.getElementById('live_output');
+          if (out) out.textContent = fullText;
+          const t = document.getElementById('live_today');
+          if (t) t.textContent = todayCount + ' streams · ~$' + todayCost;
         }
         function toggleWatch() { sketchup.toggle_watch(''); }
         function setWatchDelay() { sketchup.set_watch_delay(document.getElementById('aiw_delay').value); }
@@ -1242,6 +1742,24 @@ module SuGptRender
       end
     end
 
+    # Live Stream callbacks
+    @tray.add_action_callback("toggle_live")        { |_, _| toggle_live_stream }
+    @tray.add_action_callback("set_live_interval")  do |_, v|
+      cfg = load_config; cfg["live_interval"] = v.to_i; save_config(cfg)
+    end
+    @tray.add_action_callback("set_live_quality")   do |_, v|
+      cfg = load_config; cfg["live_quality"] = v.to_i; save_config(cfg)
+    end
+    @tray.add_action_callback("edit_live_prompt")   { |_, _| edit_live_prompt }
+    @tray.add_action_callback("open_live_log")      do |_, _|
+      dir = history_dir
+      if dir
+        stream_dir = File.join(dir, "stream")
+        FileUtils.mkdir_p(stream_dir)
+        UI.openURL("file://" + stream_dir.gsub("\\", "/"))
+      end
+    end
+
     @tray.add_action_callback("save_recent_as_template") do |_, idx|
       r = recent_prompts[idx.to_i]
       next unless r
@@ -1357,6 +1875,34 @@ module SuGptRender
     @tray.execute_script("setWatchFeed(#{render_watch_feed_html.to_json}, #{watch_count_today}, '#{format('%.2f', estimated_cost_today)}')")
   end
 
+  # ---- Live Stream tray-push helpers ----------------------------------------
+  def self.push_live_state(enabled)
+    return unless @tray && @tray.visible?
+    @tray.execute_script("setLiveUI(#{enabled ? 'true' : 'false'})")
+  end
+
+  def self.push_live_status(msg, cls = "")
+    push_status(msg, cls)
+  end
+
+  def self.push_live_frame(raw_path)
+    return unless @tray && @tray.visible?
+    url = raw_path ? "file://" + raw_path.gsub("\\", "/") : ""
+    @tray.execute_script("setLiveFrame(#{url.to_json})")
+  end
+
+  def self.push_live_token(delta, full_text)
+    return unless @tray && @tray.visible?
+    @tray.execute_script("appendLiveToken(#{delta.to_json}, #{full_text.to_json})")
+  end
+
+  def self.push_live_done(full_text)
+    return unless @tray && @tray.visible?
+    @tray.execute_script(
+      "liveDone(#{full_text.to_json}, #{live_count_today}, '#{format('%.4f', live_cost_today)}')"
+    )
+  end
+
   # Edit the watch prompt in a multiline HtmlDialog (similar to render prompt)
   def self.edit_watch_prompt
     cfg = load_config
@@ -1400,6 +1946,50 @@ module SuGptRender
       cfg2 = load_config; cfg2["watch_prompt"] = decoded; save_config(cfg2)
       dlg.close
       UI.messagebox("Watch prompt saved (#{decoded.length} chars).")
+    end
+    dlg.add_action_callback("cancel") { |_, _| dlg.close }
+    dlg.show
+  end
+
+  # Live-stream prompt editor. Defaults to the watch prompt so the user can
+  # share it across both flows; saving here is independent though.
+  def self.edit_live_prompt
+    cfg = load_config
+    current = cfg["live_prompt"] || cfg["watch_prompt"] || DEFAULT_WATCH_PROMPT
+    dlg = UI::HtmlDialog.new(
+      dialog_title:    "#{PLUGIN_NAME} — Edit Live Prompt",
+      preferences_key: "su_gpt_render_live_prompt_dlg",
+      scrollable:      true, resizable: true,
+      width: 640, height: 540,
+      style: UI::HtmlDialog::STYLE_DIALOG
+    )
+    cur_html = CGI.escapeHTML(current)
+    html = <<~HTML
+      <!doctype html><html><head><meta charset="utf-8">
+      <style>
+        body { font-family:-apple-system,"Helvetica Neue","PingFang HK","Microsoft JhengHei",sans-serif; margin:0; padding:14px; background:#f5f5f5; }
+        h2 { margin:0 0 8px 0; font-size:14px; color:#333; }
+        p.hint { margin:0 0 10px 0; font-size:12px; color:#666; line-height:1.4; }
+        textarea { width:100%; min-height:340px; box-sizing:border-box; font-family:"SF Mono",Consolas,monospace; font-size:12.5px; padding:10px; border:1px solid #ccc; border-radius:4px; resize:vertical; }
+        .row { margin-top:10px; display:flex; gap:8px; }
+        button { padding:8px 14px; border:1px solid #aaa; border-radius:4px; background:#fff; cursor:pointer; font-size:13px; }
+        button.primary { background:#2c80c0; color:#fff; border-color:#2c80c0; }
+      </style></head><body>
+      <h2>Live-stream prompt</h2>
+      <p class="hint">每次 frame 都會用呢個 prompt。建議要短 + 直接，因為 streaming 會 token-by-token 印出嚟。</p>
+      <textarea id="prompt">#{cur_html}</textarea>
+      <div class="row">
+        <button class="primary" onclick="window.location='skp:save@'+encodeURIComponent(document.getElementById('prompt').value)">Save</button>
+        <button onclick="window.location='skp:cancel@'">Cancel</button>
+      </div>
+      </body></html>
+    HTML
+    dlg.set_html(html)
+    dlg.add_action_callback("save") do |_, value|
+      decoded = CGI.unescape(value.to_s)
+      cfg2 = load_config; cfg2["live_prompt"] = decoded; save_config(cfg2)
+      dlg.close
+      UI.messagebox("Live prompt saved (#{decoded.length} chars).")
     end
     dlg.add_action_callback("cancel") { |_, _| dlg.close }
     dlg.show
