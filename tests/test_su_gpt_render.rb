@@ -534,6 +534,8 @@ class TestAiWatch < Minitest::Test
       enabled: false, pending_timer: nil, observer: nil,
       bg_thread: nil, bg_poll_timer: nil
     })
+    # Clear any lingering @tray from TestHotReload's MARKER strings
+    SuGptRender.instance_variable_set(:@tray, nil)
   end
 
   def teardown
