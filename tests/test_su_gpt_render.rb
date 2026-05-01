@@ -235,6 +235,39 @@ class TestHotReload < Minitest::Test
     assert_equal "new", SuGptRender::TEST_CONST
     tmp.unlink
   end
+
+  # Critical: silent-update relies on @tray reference SURVIVING `load`.
+  # `@tray = nil` at module top would reset it. We use `@tray ||= nil`.
+  def test_load_preserves_module_ivars_with_or_equals
+    SuGptRender.instance_variable_set(:@tray, "MARKER")
+    tmp = Tempfile.new(["plugin_ivar", ".rb"])
+    tmp.write <<~RUBY
+      module SuGptRender
+        @tray ||= nil    # ||= preserves existing
+      end
+    RUBY
+    tmp.close
+    load tmp.path
+    assert_equal "MARKER", SuGptRender.instance_variable_get(:@tray),
+      "||= should preserve the live tray reference across load"
+    tmp.unlink
+  end
+
+  def test_plain_assignment_loses_ivar_across_load
+    # Sanity check: confirm the Ruby semantics we're guarding against.
+    SuGptRender.instance_variable_set(:@tray, "WILL_BE_LOST")
+    tmp = Tempfile.new(["plugin_bug", ".rb"])
+    tmp.write <<~RUBY
+      module SuGptRender
+        @tray = nil    # plain = wipes
+      end
+    RUBY
+    tmp.close
+    load tmp.path
+    assert_nil SuGptRender.instance_variable_get(:@tray),
+      "plain = is destructive across load (this is the bug we fixed in 0.2.9)"
+    tmp.unlink
+  end
 end
 
 # ============================================================================

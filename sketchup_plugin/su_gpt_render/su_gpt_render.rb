@@ -13,7 +13,7 @@ require 'time'
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.2.8"
+  PLUGIN_VERSION = "0.2.9"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -323,9 +323,15 @@ module SuGptRender
   end
 
   # ------ tray dialog --------------------------------------------------------
-  @tray = nil
-  @bg_thread = nil
-  @bg_timer = nil
+  # Use ||= so that `load __FILE__` (hot-reload) preserves these references.
+  # If we used = the load would reset @tray to nil and we'd lose the live dialog.
+  @tray                  ||= nil
+  @bg_thread             ||= nil
+  @bg_timer              ||= nil
+  @initial_update_timer  ||= nil
+  @recurring_update_timer ||= nil
+  @update_thread         ||= nil
+  @update_poll_timer     ||= nil
 
   def self.tray_html
     cfg = load_config
@@ -1331,6 +1337,11 @@ module SuGptRender
       target = __FILE__
       File.binwrite(target, res2.body)
 
+      # Save tray reference before load (load re-runs the module body and
+      # would otherwise wipe @tray / @bg_thread). Even with ||= guard this
+      # is a belt-and-braces measure for action_callbacks rebinding too.
+      saved_tray = @tray
+
       # ---- HOT RELOAD ----
       # Re-execute the just-written file to pick up new method definitions.
       # `load` re-runs the top-level body; methods get redefined; constants
@@ -1343,13 +1354,22 @@ module SuGptRender
         $VERBOSE = prev_verbose
       end
 
-      # Refresh the tray dialog: HTML strings + action_callbacks were captured
-      # against the OLD code; close+reopen rebinds to NEW code.
+      # Restore the tray reference (||= already guards but keep explicit)
+      @tray = saved_tray
+
+      # Refresh the tray IN PLACE via set_html. The live HtmlDialog stays
+      # open, action_callbacks already registered are late-bound to method
+      # names so they auto-resolve to the new code. No flicker, no close.
       if @tray && @tray.visible?
-        @tray.close
-        @tray = nil
-        # Tiny delay to let close finish before reopen, on a UI timer
-        UI.start_timer(0.2, false) { show_tray rescue nil }
+        begin
+          @tray.set_html(tray_html)
+        rescue => e
+          # If set_html-on-shown-dialog fails on this SU version, fall back
+          # to close+reopen.
+          @tray.close
+          @tray = nil
+          UI.start_timer(0.2, false) { show_tray rescue nil }
+        end
       end
 
       msg = "⚡ Auto-updated to v#{remote_ver} (live, no restart)"
