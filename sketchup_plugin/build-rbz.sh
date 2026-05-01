@@ -5,8 +5,8 @@
 # CF / Gemini credentials (would otherwise trip secret-scanning + leak to anyone
 # who clones). Real values only land in the shipped artifact.
 #
-# Reads secrets from $CF_AIG_TOKEN and $GEMINI_API_KEY in the env or from
-# `--env-file <path>`. Writes:
+# Reads $CF_AIG_TOKEN from env or `--env-file <path>` (only one secret needed
+# now — Gemini API key is BYOK on the gateway side, never bundled). Writes:
 #   - releases/su_gpt_render.rbz     (zip with secrets injected)
 #   - releases/su_gpt_render.rb      (the injected ruby file alone — used as
 #                                     auto-update rb_url target)
@@ -42,29 +42,29 @@ if [[ -n "$ENV_FILE" ]]; then
 fi
 
 : "${CF_AIG_TOKEN:?CF_AIG_TOKEN must be set (live env or --env-file)}"
-: "${GEMINI_API_KEY:?GEMINI_API_KEY must be set (live env or --env-file)}"
 
 echo "→ building .rbz from $SRC"
-echo "  CF_AIG_TOKEN  length: ${#CF_AIG_TOKEN}"
-echo "  GEMINI_API_KEY length: ${#GEMINI_API_KEY}"
+echo "  CF_AIG_TOKEN length: ${#CF_AIG_TOKEN}"
 
 mkdir -p "$OUT_DIR"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 # Inject — use python so we don't have to escape sed special chars.
-python3 - "$SRC" "$TMP_DIR/su_gpt_render.rb" "$CF_AIG_TOKEN" "$GEMINI_API_KEY" <<'PY'
+python3 - "$SRC" "$TMP_DIR/su_gpt_render.rb" "$CF_AIG_TOKEN" <<'PY'
 import sys
-src, dst, tok, key = sys.argv[1:5]
+src, dst, tok = sys.argv[1:4]
 content = open(src).read()
-for needle, val in (("__INJECT_CF_AIG_TOKEN__", tok), ("__INJECT_GEMINI_API_KEY__", key)):
-    if needle not in content:
-        print(f"WARN: placeholder not found: {needle}", file=sys.stderr)
-    content = content.replace(needle, val)
-# Sanity: no placeholders should survive.
-remaining = [m for m in ("__INJECT_CF_AIG_TOKEN__", "__INJECT_GEMINI_API_KEY__") if m in content]
-if remaining:
-    print(f"FATAL: placeholders still in output: {remaining}", file=sys.stderr)
+needle = "__INJECT_CF_AIG_TOKEN__"
+if needle not in content:
+    print(f"WARN: placeholder not found: {needle}", file=sys.stderr)
+content = content.replace(needle, tok)
+if needle in content:
+    print(f"FATAL: placeholder still in output: {needle}", file=sys.stderr)
+    sys.exit(1)
+# Also fail if a stray AIza-key placeholder leaked back in.
+if "__INJECT_GEMINI_API_KEY__" in content:
+    print("FATAL: GEMINI_API_KEY placeholder reappeared — source should be BYOK only", file=sys.stderr)
     sys.exit(1)
 open(dst, "w").write(content)
 PY

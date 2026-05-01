@@ -14,7 +14,7 @@ require 'thread'   # Queue used by Live Stream main↔bg thread handoff
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.4.2"
+  PLUGIN_VERSION = "0.4.3"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -26,18 +26,31 @@ module SuGptRender
   # and egresses through non-HK IPs. Empirically verified from HK with HTTP
   # 200, 1.3-1.6s latency, and SSE streaming works.
   #
-  # Two secrets below are placeholders in source — replaced at .rbz build time
-  # by sketchup_plugin/build-rbz.sh from $CF_AIG_TOKEN / $GEMINI_API_KEY env.
-  # Source on GitHub stays clean; secrets only land in shipped .rbz / release
-  # asset .rb (which are also the URL the auto-update flow fetches).
-  # Bundled in-plugin is internal-deploy-only; accepted leak risk per the firm.
-  GEMINI_AIG_URL   = "https://gateway.ai.cloudflare.com/v1/945eb571b27f72d3ad419c2468313f6f/hohome-gemini/google-ai-studio/v1"
+  # CF AI Gateway is configured with BYOK ("Bring Your Own Key") for Google AI
+  # Studio: the Gemini API key is stored in the gateway's settings server-side
+  # and the gateway auto-attaches it to upstream requests. The plugin therefore
+  # only ships the cf-aig-authorization token; the Google key never appears in
+  # the .rbz / release-asset .rb. This matters because release artifacts are
+  # public — earlier versions bundled the Google key and Google's leaked-key
+  # bot revoked it within ~hours, breaking the plugin in the field.
+  #
+  # The CF token below is a placeholder in source — replaced at .rbz build
+  # time by sketchup_plugin/build-rbz.sh from $CF_AIG_TOKEN. Source on GitHub
+  # stays clean; the secret only lands in the shipped .rbz / release asset.
+  GEMINI_AIG_URL   = "https://gateway.ai.cloudflare.com/v1/945eb571b27f72d3ad419c2468313f6f/hohome-gemini/google-ai-studio"
   GEMINI_AIG_TOKEN = "__INJECT_CF_AIG_TOKEN__"
-  GEMINI_API_KEY   = "__INJECT_GEMINI_API_KEY__"
 
   # Sentinel id used in WATCH_MODELS dropdown to mean "go through AI Gateway
-  # directly to Gemini 2.5 Flash, bypass Poe". Cheaper since no Poe markup.
+  # directly to Gemini, bypass Poe". Cheaper since no Poe markup.
   GEMINI_DIRECT_ID = "gemini-2.5-flash-direct"
+
+  # Models that support disabling thinking (thinkingBudget=0). Other models
+  # like gemini-3.1-pro-preview reject thinkingBudget=0 with
+  # "Budget 0 is invalid. This model only works in thinking mode."
+  GEMINI_THINKING_DISABLABLE = %w[
+    gemini-2.5-flash
+    gemini-3.1-flash-lite-preview
+  ].freeze
 
   # Vision models for AI Watch (text+image → text). First entry = default.
   # The "*-direct" id is the sentinel for AI-Gateway-routed Gemini (see
@@ -412,24 +425,40 @@ module SuGptRender
   # Build the request shape Gemini expects: an inlineData image part plus a
   # text part. Used for both non-streaming (AI Watch direct) and streaming
   # (Live Stream tab) requests so the body shape stays identical.
-  def self.build_gemini_payload(image_path, prompt, mime_type: "image/jpeg")
+  #
+  # generationConfig:
+  #   - thinkingBudget=0 for thinking-disablable models — without this, Gemini
+  #     2.5+ silently spends all maxOutputTokens on internal "thoughts" and
+  #     emits zero candidate text (root cause of the empty-Live-Stream bug).
+  #   - maxOutputTokens=1024 caps the visible response. Live Stream feedback
+  #     should be brief; the user can re-ask for more detail.
+  def self.build_gemini_payload(image_path, prompt, model: "gemini-2.5-flash",
+                                mime_type: "image/jpeg", max_output_tokens: 1024)
     img_b64 = Base64.strict_encode64(File.binread(image_path))
-    {
+    body = {
       "contents" => [{
         "parts" => [
           { "inlineData" => { "mimeType" => mime_type, "data" => img_b64 } },
           { "text" => prompt },
         ]
-      }]
+      }],
+      "generationConfig" => {
+        "maxOutputTokens" => max_output_tokens,
+      },
     }
+    if GEMINI_THINKING_DISABLABLE.include?(model)
+      body["generationConfig"]["thinkingConfig"] = { "thinkingBudget" => 0 }
+    end
+    body
   end
 
-  # Both auth headers AI Gateway requires. Centralized so tests can verify
-  # the request shape and so the streaming + non-streaming paths can't drift.
+  # Single auth header AI Gateway requires (BYOK mode — Google API key is
+  # stored in the gateway settings server-side and auto-attached to upstream).
+  # Centralized so tests can verify request shape and the streaming +
+  # non-streaming paths can't drift.
   def self.gemini_aig_headers
     {
       "cf-aig-authorization" => "Bearer #{GEMINI_AIG_TOKEN}",
-      "x-goog-api-key"       => GEMINI_API_KEY,
       "Content-Type"         => "application/json",
     }
   end
@@ -437,8 +466,8 @@ module SuGptRender
   # Non-streaming Gemini call — used by AI Watch when user picks the direct
   # model. Returns the joined text from candidates[0].content.parts[*].text.
   def self.call_gemini_direct(image_path, prompt, model: "gemini-2.5-flash", mime_type: "image/jpeg")
-    url = "#{GEMINI_AIG_URL}/models/#{model}:generateContent"
-    payload = build_gemini_payload(image_path, prompt, mime_type: mime_type)
+    url = "#{GEMINI_AIG_URL}/v1beta/models/#{model}:generateContent"
+    payload = build_gemini_payload(image_path, prompt, model: model, mime_type: mime_type)
     res = http_post_json(url, gemini_aig_headers, JSON.generate(payload))
     unless res.is_a?(Net::HTTPSuccess)
       raise "Gemini AI Gateway HTTP #{res.code}: #{res.body[0,300]}"
@@ -514,8 +543,8 @@ module SuGptRender
   # Queue that the main UI timer drains.
   def self.stream_gemini(image_path, prompt, model: "gemini-2.5-flash",
                         mime_type: "image/jpeg", &on_token)
-    url = "#{GEMINI_AIG_URL}/models/#{model}:streamGenerateContent?alt=sse"
-    payload = JSON.generate(build_gemini_payload(image_path, prompt, mime_type: mime_type))
+    url = "#{GEMINI_AIG_URL}/v1beta/models/#{model}:streamGenerateContent?alt=sse"
+    payload = JSON.generate(build_gemini_payload(image_path, prompt, model: model, mime_type: mime_type))
     uri = URI.parse(url)
     http = Net::HTTP.new(uri.host, uri.port)
     configure_http(http, uri.scheme)

@@ -721,23 +721,31 @@ class TestAiGatewayConstants < Minitest::Test
   def test_constants_present
     assert SuGptRender::GEMINI_AIG_URL.start_with?("https://gateway.ai.cloudflare.com/v1/"),
       "AI Gateway URL points at gateway.ai.cloudflare.com"
-    assert SuGptRender::GEMINI_AIG_URL.include?("/google-ai-studio/v1"),
+    assert SuGptRender::GEMINI_AIG_URL.include?("/google-ai-studio"),
       "URL includes the google-ai-studio sub-path"
-    # Tokens are placeholders in source (`__INJECT_*__`) and replaced at build
-    # time by build-rbz.sh. Either form is valid; tests run on dev source.
+    refute SuGptRender::GEMINI_AIG_URL.end_with?("/v1"),
+      "URL must NOT end with /v1 — `/v1beta` is appended at call time so " \
+      "thinkingConfig is accepted by Gemini API"
+    # Token is a placeholder in source (`__INJECT_CF_AIG_TOKEN__`) and replaced
+    # at build time by build-rbz.sh. Either form is valid; tests run on dev source.
     tok = SuGptRender::GEMINI_AIG_TOKEN
     assert tok.start_with?("cfut_") || tok == "__INJECT_CF_AIG_TOKEN__",
       "AIG token must be real cfut_ value or build placeholder, got #{tok.inspect}"
-    key = SuGptRender::GEMINI_API_KEY
-    assert key.start_with?("AIza") || key == "__INJECT_GEMINI_API_KEY__",
-      "Gemini key must be real AIza value or build placeholder, got #{key.inspect}"
   end
 
-  def test_aig_headers_have_both_auth
+  def test_no_gemini_api_key_constant
+    # As of v0.4.3, Gemini key is BYOK on AI Gateway side — never bundled in
+    # plugin. Guard against accidental reintroduction.
+    refute SuGptRender.const_defined?(:GEMINI_API_KEY, false),
+      "GEMINI_API_KEY must NOT be defined on the module — BYOK only"
+  end
+
+  def test_aig_headers_only_cf_auth
     h = SuGptRender.gemini_aig_headers
     assert_equal "Bearer #{SuGptRender::GEMINI_AIG_TOKEN}", h["cf-aig-authorization"]
-    assert_equal SuGptRender::GEMINI_API_KEY, h["x-goog-api-key"]
     assert_equal "application/json", h["Content-Type"]
+    refute h.key?("x-goog-api-key"),
+      "BYOK: gateway attaches Google key server-side, plugin must not send it"
   end
 
   def test_watch_dropdown_includes_direct_option
@@ -791,8 +799,8 @@ class TestGeminiDirectRequest < Minitest::Test
     posted_url = posts.first[1]
     assert posted_url.start_with?(SuGptRender::GEMINI_AIG_URL),
       "URL prefix is the AI Gateway base"
-    assert posted_url.include?("/models/gemini-2.5-flash:generateContent"),
-      "URL includes the right model + action: #{posted_url}"
+    assert posted_url.include?("/v1beta/models/gemini-2.5-flash:generateContent"),
+      "URL uses /v1beta path (thinkingConfig requires it): #{posted_url}"
 
     # Verify the body shape — inlineData + text parts.
     payload = JSON.parse(posts.first[2])
@@ -825,6 +833,29 @@ class TestGeminiDirectRequest < Minitest::Test
     expected = Base64.strict_encode64(File.binread(@tmpimg.path))
     assert_equal expected, parts[0]["inlineData"]["data"]
     assert_equal "hi", parts[1]["text"]
+  end
+
+  def test_payload_has_thinking_budget_zero_for_flash
+    payload = SuGptRender.build_gemini_payload(@tmpimg.path, "p", model: "gemini-2.5-flash")
+    assert_equal 0, payload.dig("generationConfig", "thinkingConfig", "thinkingBudget"),
+      "thinkingBudget=0 needed or all output goes to thoughts (the v0.4.0–0.4.2 empty-Live-Stream bug)"
+    assert payload.dig("generationConfig", "maxOutputTokens"),
+      "maxOutputTokens cap present"
+  end
+
+  def test_payload_has_thinking_budget_zero_for_flash_lite
+    payload = SuGptRender.build_gemini_payload(@tmpimg.path, "p", model: "gemini-3.1-flash-lite-preview")
+    assert_equal 0, payload.dig("generationConfig", "thinkingConfig", "thinkingBudget")
+  end
+
+  def test_payload_omits_thinking_budget_for_pro
+    # gemini-3.1-pro-preview rejects thinkingBudget=0 with
+    # "Budget 0 is invalid. This model only works in thinking mode."
+    payload = SuGptRender.build_gemini_payload(@tmpimg.path, "p", model: "gemini-3.1-pro-preview")
+    refute payload.dig("generationConfig", "thinkingConfig"),
+      "must NOT send thinkingConfig for thinking-mandatory models"
+    # maxOutputTokens still present
+    assert payload.dig("generationConfig", "maxOutputTokens")
   end
 end
 
@@ -1033,7 +1064,7 @@ end
 
 class TestVersionBump < Minitest::Test
   # Single source of truth — bump when releasing.
-  EXPECTED_VERSION = "0.4.2"
+  EXPECTED_VERSION = "0.4.3"
 
   def test_plugin_version_matches_expected
     assert_equal EXPECTED_VERSION, SuGptRender::PLUGIN_VERSION

@@ -1,5 +1,5 @@
 {
-  "version": "0.4.2",
-  "rb_url": "https://github.com/hohomehk/sketchupdrawing/releases/download/v0.4.2/su_gpt_render.rb",
-  "notes": "v0.4.2 — Auto-update fix. http_get now follows up to 5 HTTP redirects, so the GitHub release-asset rb_url (302 → release-assets.githubusercontent.com CDN) downloads correctly. v0.4.1 silently failed to auto-update for this reason; users on v0.4.0 or v0.4.1 must manually install this .rbz once, after which silent updates resume. No other behavior changes."
+  "version": "0.4.3",
+  "rb_url": "https://github.com/hohomehk/sketchupdrawing/releases/download/v0.4.3/su_gpt_render.rb",
+  "notes": "v0.4.3 — fix empty Live Stream output + drop bundled Gemini key. Three changes: (1) URL path /v1 → /v1beta so generationConfig.thinkingConfig is accepted by Gemini API. (2) Set thinkingConfig.thinkingBudget=0 for flash models — earlier versions silently spent all maxOutputTokens on internal 'thoughts' and emitted zero candidate text, hence the empty streamed output users hit on 0.4.0–0.4.2. (3) BYOK: Gemini API key now stored in CF AI Gateway settings server-side; plugin only ships the cf-aig-authorization token. Fixes Google's automatic leaked-key revocation that broke the field a few hours after 0.4.0/0.4.1 shipped. gemini-3.1-pro-preview added as a watch+stream option (thinking on by design)."
 }
