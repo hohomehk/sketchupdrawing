@@ -1033,7 +1033,7 @@ end
 
 class TestVersionBump < Minitest::Test
   # Single source of truth — bump when releasing.
-  EXPECTED_VERSION = "0.4.1"
+  EXPECTED_VERSION = "0.4.2"
 
   def test_plugin_version_matches_expected
     assert_equal EXPECTED_VERSION, SuGptRender::PLUGIN_VERSION
@@ -1045,5 +1045,107 @@ class TestVersionBump < Minitest::Test
     assert_equal EXPECTED_VERSION, data["version"]
     refute_empty data["notes"], "release notes must not be empty"
     assert data["rb_url"].start_with?("https://"), "rb_url is https"
+  end
+end
+
+# ============================================================================
+# v0.4.2 — http_get must follow GitHub release-asset 302 redirects.
+# Tests target http_get_once (one full GET round, including redirect chase) so
+# we don't fight the per-test stub override of http_get itself.
+# ============================================================================
+
+class TestHttpRedirectFollowing < Minitest::Test
+  # Tiny response shims that pass `is_a?(Net::HTTPRedirection|HTTPSuccess)`.
+  class FakeRedirect
+    def initialize(loc); @loc = loc; end
+    def is_a?(klass); klass == Net::HTTPRedirection; end
+    def [](h); h == "location" ? @loc : nil; end
+    def code; "302"; end
+  end
+
+  class FakeSuccess
+    def initialize(body); @body = body; end
+    def is_a?(klass); klass == Net::HTTPSuccess; end
+    def [](_); nil; end
+    def body; @body; end
+    def code; "200"; end
+  end
+
+  # Stub-driven fake of Net::HTTP — captures host of each connect, returns a
+  # scripted sequence of responses regardless of which path the client requests.
+  class FakeNetHTTP
+    @@hosts = []
+    @@responses = []
+    def self.reset!(responses); @@hosts = []; @@responses = responses.dup; end
+    def self.hosts; @@hosts; end
+    def initialize(host, _port = nil); @@hosts << host; end
+    def use_ssl=(*); end
+    def verify_mode=(*); end
+    def min_version=(*); end
+    def ssl_version=(*); end
+    def cert_store=(*); end
+    def open_timeout=(*); end
+    def read_timeout=(*); end
+    def request(_req); @@responses.shift or raise "ran out of fake responses"; end
+  end
+
+  def with_fake_http(responses)
+    FakeNetHTTP.reset!(responses)
+    Net::HTTP.stub :new, ->(*args) { FakeNetHTTP.new(*args) } do
+      yield
+    end
+  end
+
+  def test_follows_single_302
+    with_fake_http([
+      FakeRedirect.new("https://final.example.com/file.rb"),
+      FakeSuccess.new("real plugin code"),
+    ]) do
+      res = SuGptRender.http_get_once("https://github.com/owner/repo/releases/download/v9/file.rb")
+      assert_kind_of FakeSuccess, res
+      assert_equal "real plugin code", res.body
+      # Confirm we contacted both hosts in order.
+      assert_equal ["github.com", "final.example.com"], FakeNetHTTP.hosts
+    end
+  end
+
+  def test_follows_chain_of_3
+    with_fake_http([
+      FakeRedirect.new("https://hop1.example.com/a"),
+      FakeRedirect.new("https://hop2.example.com/b"),
+      FakeSuccess.new("OK"),
+    ]) do
+      res = SuGptRender.http_get_once("https://start.example.com/x")
+      assert_equal "OK", res.body
+      assert_equal ["start.example.com", "hop1.example.com", "hop2.example.com"], FakeNetHTTP.hosts
+    end
+  end
+
+  def test_relative_redirect_resolved_against_origin
+    with_fake_http([
+      FakeRedirect.new("/relative/path"),
+      FakeSuccess.new("OK"),
+    ]) do
+      SuGptRender.http_get_once("https://server.example.com/start")
+      assert_equal ["server.example.com", "server.example.com"], FakeNetHTTP.hosts
+    end
+  end
+
+  def test_returns_non_redirect_unchanged
+    with_fake_http([FakeSuccess.new("direct")]) do
+      res = SuGptRender.http_get_once("https://direct.example.com/x")
+      assert_equal "direct", res.body
+      assert_equal 1, FakeNetHTTP.hosts.size
+    end
+  end
+
+  def test_too_many_redirects_raises
+    loops = Array.new(7) { FakeRedirect.new("https://loop.example.com/next") }
+    with_fake_http(loops) do
+      err = assert_raises(RuntimeError) do
+        SuGptRender.http_get_once("https://start.example.com/x", max_redirects: 5)
+      end
+      assert_match(/Too many redirects/, err.message)
+    end
   end
 end

@@ -14,7 +14,7 @@ require 'thread'   # Queue used by Live Stream main↔bg thread handoff
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.4.1"
+  PLUGIN_VERSION = "0.4.2"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -319,20 +319,35 @@ module SuGptRender
     raise "HTTPS failed after #{attempts} attempts: #{last_err.class}: #{last_err.message}\n\nIf this persists, try Set SSL Verify (off) in the menu."
   end
 
-  def self.http_get(url, attempts: 3)
-    uri = URI.parse(url)
+  def self.http_get(url, attempts: 3, max_redirects: 5)
     last_err = nil
     attempts.times do |i|
-      http = Net::HTTP.new(uri.host, uri.port)
-      configure_http(http, uri.scheme)
       begin
-        return http.request(Net::HTTP::Get.new(uri.request_uri))
+        return http_get_once(url, max_redirects: max_redirects)
       rescue OpenSSL::SSL::SSLError, Errno::ECONNRESET, Errno::EPIPE, Net::OpenTimeout, Net::ReadTimeout, EOFError => e
         last_err = e
         sleep(1.0 + i * 2.0) unless i == attempts - 1
       end
     end
     raise "HTTPS GET failed: #{last_err.class}: #{last_err.message}"
+  end
+
+  # GitHub release-asset URLs 302 → release-assets.githubusercontent.com CDN.
+  # Without redirect-following, auto-update silently fails — version.json's
+  # rb_url stopped pointing at raw main as of v0.4.1.
+  def self.http_get_once(url, max_redirects: 5)
+    max_redirects.times do |hop|
+      uri = URI.parse(url)
+      http = Net::HTTP.new(uri.host, uri.port)
+      configure_http(http, uri.scheme)
+      res = http.request(Net::HTTP::Get.new(uri.request_uri))
+      return res unless res.is_a?(Net::HTTPRedirection)
+      next_url = res["location"].to_s
+      return res if next_url.empty?
+      # Resolve relative redirects against the original URL.
+      url = URI.join(uri.to_s, next_url).to_s
+    end
+    raise "Too many redirects (>#{max_redirects})"
   end
 
   # ------ Poe API call -------------------------------------------------------
