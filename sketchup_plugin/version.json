@@ -1,5 +1,5 @@
 {
-  "version": "0.2.4",
+  "version": "0.2.5",
   "rb_url": "https://raw.githubusercontent.com/hohomehk/sketchupdrawing/main/sketchup_plugin/su_gpt_render/su_gpt_render.rb",
-  "notes": "v0.2.4 — Full image-model list (28 models): Nano-Banana Pro/2, Imagen 4 Ultra, FLUX Kontext Max, Seededit, Qwen-Edit, etc. Dropdown grouped into Image-edit / T2I-only. Refine flow: re-render any result with delta tweak prompt. History gains model + dimension + elapsed time labels. Sidecar _meta.json saved per render."
+  "notes": "v0.2.5 — Removed text-to-image models (only image-edit models remain, 18 in total). NEW: silent hot-reload auto-update. Once on v0.2.5+, future updates download and apply via `load __FILE__` without requiring SketchUp restart. Background polls every 10 min while tray is open."
 }

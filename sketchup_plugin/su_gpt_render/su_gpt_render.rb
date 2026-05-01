@@ -12,46 +12,31 @@ require 'openssl'
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.2.4"
+  PLUGIN_VERSION = "0.2.5"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
-  # Poe image models. Each: [poe_id, label, group, hint, t2i_only]
-  # - "edit" group: accepts text+image → image (uses our SketchUp screenshot)
-  # - "t2i"  group: text → image only (ignores input image, generates from prompt)
-  # First entry is the default.
+  # Poe image models — image-editing only (accepts text+image → image).
+  # Each: [poe_id, label, hint]. First entry is the default.
   IMAGE_MODELS = [
-    # ----- Image editing (text+image → image) — recommended for SU plugin -----
-    ["GPT-Image-2",        "GPT-Image-2",         "edit", "OpenAI · 最強 prompt adherence",         false],
-    ["Nano-Banana-Pro",    "Nano-Banana Pro",     "edit", "Google · Gemini 3 Pro Image · ⭐ 最新 edit",  false],
-    ["Nano-Banana",        "Nano-Banana",         "edit", "Google · Gemini 2.5 Flash · 多語言文字",     false],
-    ["Flux-Kontext-Max",   "FLUX Kontext Max",    "edit", "BFL · 編輯最強旗艦",                          false],
-    ["Flux-Kontext-Pro",   "FLUX Kontext Pro",    "edit", "BFL · 專為 edit · 保結構好",                  false],
-    ["FLUX-2-Max",         "FLUX 2 Max",          "edit", "BFL · 多參考圖旗艦",                          false],
-    ["FLUX-2-Pro",         "FLUX 2 Pro",          "edit", "BFL · 多參考圖",                              false],
-    ["FLUX-2-Flex",        "FLUX 2 Flex",         "edit", "BFL · 大尺寸",                                false],
-    ["FLUX-2-Dev",         "FLUX 2 Dev",          "edit", "BFL · open-weight",                           false],
-    ["FLUX-Krea",          "FLUX Krea",           "edit", "BFL · Aesthetic tuned",                      false],
-    ["GPT-Image-1.5",      "GPT-Image-1.5",       "edit", "OpenAI · ChatGPT default",                    false],
-    ["GPT-Image-1",        "GPT-Image-1",         "edit", "OpenAI · 經濟",                                false],
-    ["GPT-Image-1-Mini",   "GPT-Image-1 Mini",    "edit", "OpenAI · 最平 · 快",                          false],
-    ["seededit-3.0",       "Seededit 3.0",        "edit", "Bytedance · edit",                            false],
-    ["ideogram",           "Ideogram",            "edit", "IdeogramAI",                                  false],
-    ["ideogram-v2",        "Ideogram v2",         "edit", "IdeogramAI v2",                               false],
-    ["qwen-edit",          "Qwen Edit",           "edit", "Alibaba edit",                                false],
-    ["sketch-to-image",    "Sketch-to-Image",     "edit", "Convert sketch → photo",                      false],
-
-    # ----- Text-to-image only (input image is IGNORED) -----
-    ["Nano-Banana-2",      "Nano-Banana 2",       "t2i",  "Google · 最新 T2I · 4K · 純 prompt 生成",      true],
-    ["Imagen-4-Ultra",     "Imagen 4 Ultra",      "t2i",  "Google · 最強 T2I",                            true],
-    ["Imagen-4",           "Imagen 4",            "t2i",  "Google T2I",                                   true],
-    ["Imagen-4-Fast",      "Imagen 4 Fast",       "t2i",  "Google T2I 速版",                              true],
-    ["FLUX-pro-1.1-ultra", "FLUX Pro 1.1 Ultra",  "t2i",  "BFL · 高解析 T2I",                              true],
-    ["FLUX-pro-1.1",       "FLUX Pro 1.1",        "t2i",  "BFL T2I",                                      true],
-    ["DALL-E-3",           "DALL-E 3",            "t2i",  "OpenAI 經典",                                  true],
-    ["seedream-5.0-lite",  "Seedream 5.0 Lite",   "t2i",  "Bytedance T2I",                                true],
-    ["recraft-v3",         "Recraft v3",          "t2i",  "Recraft 設計向",                               true],
-    ["luma-photon",        "Luma Photon",         "t2i",  "Luma photoreal",                               true],
+    ["GPT-Image-2",        "GPT-Image-2",         "OpenAI · 最強 prompt adherence"],
+    ["Nano-Banana-Pro",    "Nano-Banana Pro",     "Google · Gemini 3 Pro Image · ⭐ 最新"],
+    ["Nano-Banana",        "Nano-Banana",         "Google · Gemini 2.5 Flash · 多語言文字"],
+    ["Flux-Kontext-Max",   "FLUX Kontext Max",    "BFL · 編輯最強旗艦"],
+    ["Flux-Kontext-Pro",   "FLUX Kontext Pro",    "BFL · 專為 edit · 保結構好"],
+    ["FLUX-2-Max",         "FLUX 2 Max",          "BFL · 多參考圖旗艦"],
+    ["FLUX-2-Pro",         "FLUX 2 Pro",          "BFL · 多參考圖"],
+    ["FLUX-2-Flex",        "FLUX 2 Flex",         "BFL · 大尺寸"],
+    ["FLUX-2-Dev",         "FLUX 2 Dev",          "BFL · open-weight"],
+    ["FLUX-Krea",          "FLUX Krea",           "BFL · Aesthetic tuned"],
+    ["GPT-Image-1.5",      "GPT-Image-1.5",       "OpenAI · ChatGPT default"],
+    ["GPT-Image-1",        "GPT-Image-1",         "OpenAI · 經濟"],
+    ["GPT-Image-1-Mini",   "GPT-Image-1 Mini",    "OpenAI · 最平 · 快"],
+    ["seededit-3.0",       "Seededit 3.0",        "Bytedance · edit"],
+    ["ideogram",           "Ideogram",            "IdeogramAI"],
+    ["ideogram-v2",        "Ideogram v2",         "IdeogramAI v2"],
+    ["qwen-edit",          "Qwen Edit",           "Alibaba edit"],
+    ["sketch-to-image",    "Sketch-to-Image",     "Convert sketch → photo"],
   ]
 
   # Set this to a JSON URL to enable auto-update. The JSON should have:
@@ -201,18 +186,17 @@ module SuGptRender
 
   # ------ Poe API call -------------------------------------------------------
   def self.call_poe(api_key, image_path, prompt, model = "GPT-Image-2")
-    meta = IMAGE_MODELS.find { |m| m[0] == model }
-    t2i_only = meta ? meta[4] : false
-
-    content = [{ "type" => "text", "text" => prompt }]
-    unless t2i_only
-      img_b64 = Base64.strict_encode64(File.binread(image_path))
-      content << { "type" => "image_url",
-                   "image_url" => { "url" => "data:image/png;base64,#{img_b64}" } }
-    end
+    img_b64 = Base64.strict_encode64(File.binread(image_path))
     payload = {
       "model"    => model,
-      "messages" => [{ "role" => "user", "content" => content }],
+      "messages" => [{
+        "role" => "user",
+        "content" => [
+          { "type" => "text", "text" => prompt },
+          { "type" => "image_url",
+            "image_url" => { "url" => "data:image/png;base64,#{img_b64}" } }
+        ]
+      }],
       "stream"   => false
     }
     res = http_post_json(POE_ENDPOINT,
@@ -249,20 +233,10 @@ module SuGptRender
     selected_model = cfg["model"] || IMAGE_MODELS.first[0]
     history_html = render_history_html
 
-    edit_options = IMAGE_MODELS.select { |m| m[2] == "edit" }
-    t2i_options  = IMAGE_MODELS.select { |m| m[2] == "t2i" }
-    opt_html = lambda do |arr|
-      arr.map { |id, label, _grp, hint, _t2i|
-        sel = (id == selected_model) ? " selected" : ""
-        "<option value=\"#{id}\"#{sel} title=\"#{CGI.escapeHTML(hint)}\">#{CGI.escapeHTML(label)} — #{CGI.escapeHTML(hint)}</option>"
-      }.join("\n")
-    end
-    model_options_html =
-      "<optgroup label=\"Image-edit (uses your SketchUp view)\">\n" +
-      opt_html.call(edit_options) +
-      "\n</optgroup>\n<optgroup label=\"Text-to-image only (ignores SketchUp view)\">\n" +
-      opt_html.call(t2i_options) +
-      "\n</optgroup>"
+    model_options_html = IMAGE_MODELS.map { |id, label, hint|
+      sel = (id == selected_model) ? " selected" : ""
+      "<option value=\"#{id}\"#{sel} title=\"#{CGI.escapeHTML(hint)}\">#{CGI.escapeHTML(label)} — #{CGI.escapeHTML(hint)}</option>"
+    }.join("\n")
 
     <<~HTML
       <!doctype html><html><head><meta charset="utf-8">
@@ -559,8 +533,40 @@ module SuGptRender
 
     @tray.show
 
-    # Background update check
-    Thread.new { sleep 2; check_update(false) rescue nil }
+    # Background auto-update check on open: if a new version is published,
+    # download + hot-reload silently (UI on main thread via UI.start_timer).
+    @auto_update_thread = Thread.new do
+      sleep 2
+      begin
+        if remote_update_available?
+          UI.start_timer(0, false) { download_update_and_apply(verbose: false) rescue nil }
+        end
+      rescue
+      end
+    end
+
+    # Recurring auto-update check: every 10 minutes. UI.start_timer fires on
+    # the main thread, where it's safe to call download_update_and_apply.
+    @recurring_update_timer ||= UI.start_timer(600, true) do
+      Thread.new do
+        begin
+          if remote_update_available?
+            UI.start_timer(0, false) { download_update_and_apply(verbose: false) rescue nil }
+          end
+        rescue
+        end
+      end
+    end
+  end
+
+  # Lightweight check: returns true if remote manifest version > local.
+  def self.remote_update_available?
+    return false if UPDATE_MANIFEST_URL.nil? || UPDATE_MANIFEST_URL.empty?
+    res = http_get(UPDATE_MANIFEST_URL, attempts: 1) rescue nil
+    return false unless res.is_a?(Net::HTTPSuccess)
+    data = JSON.parse(res.body) rescue nil
+    return false unless data
+    version_newer?(data["version"].to_s, PLUGIN_VERSION)
   end
 
   def self.refresh_tray
@@ -922,22 +928,65 @@ module SuGptRender
   end
 
   def self.download_update
-    return if UPDATE_MANIFEST_URL.nil? || UPDATE_MANIFEST_URL.empty?
-    begin
-      res = http_get(UPDATE_MANIFEST_URL)
-      raise "manifest HTTP #{res.code}" unless res.is_a?(Net::HTTPSuccess)
-      data = JSON.parse(res.body)
-      rb_url = data["rb_url"].to_s
-      raise "no rb_url in manifest" if rb_url.empty?
+    download_update_and_apply(verbose: true)
+  end
 
+  # Hot-reload: download new .rb, write to disk, then `load` it to redefine
+  # methods/constants in the live Ruby session, then close+reopen the tray
+  # so the HtmlDialog rebinds to the new HTML and callbacks. No SU restart.
+  def self.download_update_and_apply(verbose: false)
+    return false if UPDATE_MANIFEST_URL.nil? || UPDATE_MANIFEST_URL.empty?
+    # Don't disrupt an in-flight render
+    if @bg_thread && @bg_thread.alive?
+      UI.messagebox("Render in progress — try update again after.") if verbose
+      return false
+    end
+    begin
+      res = http_get(UPDATE_MANIFEST_URL, attempts: 2)
+      return false unless res.is_a?(Net::HTTPSuccess)
+      data = JSON.parse(res.body)
+      remote_ver = data["version"].to_s
+      unless version_newer?(remote_ver, PLUGIN_VERSION)
+        UI.messagebox("Already up-to-date (v#{PLUGIN_VERSION}).") if verbose
+        return false
+      end
+
+      rb_url = data["rb_url"].to_s
+      return false if rb_url.empty?
       res2 = http_get(rb_url)
-      raise "rb HTTP #{res2.code}" unless res2.is_a?(Net::HTTPSuccess)
+      return false unless res2.is_a?(Net::HTTPSuccess)
 
       target = __FILE__
       File.binwrite(target, res2.body)
-      UI.messagebox("Updated to v#{data['version']}.\n\nRestart SketchUp to take effect.\n\nFile updated: #{target}")
+
+      # ---- HOT RELOAD ----
+      # Re-execute the just-written file to pick up new method definitions.
+      # `load` re-runs the top-level body; methods get redefined; constants
+      # show "already initialized" warnings unless we silence them.
+      prev_verbose = $VERBOSE
+      $VERBOSE = nil
+      begin
+        load target
+      ensure
+        $VERBOSE = prev_verbose
+      end
+
+      # Refresh the tray dialog: HTML strings + action_callbacks were captured
+      # against the OLD code; close+reopen rebinds to NEW code.
+      if @tray && @tray.visible?
+        @tray.close
+        @tray = nil
+        # Tiny delay to let close finish before reopen, on a UI timer
+        UI.start_timer(0.2, false) { show_tray rescue nil }
+      end
+
+      msg = "⚡ Auto-updated to v#{remote_ver} (live, no restart)"
+      push_status(msg, "ok")
+      UI.messagebox("#{msg}\n\n#{data['notes']}") if verbose
+      true
     rescue => e
-      UI.messagebox("Update failed: #{e.message}")
+      UI.messagebox("Auto-update failed: #{e.message}") if verbose
+      false
     end
   end
 
