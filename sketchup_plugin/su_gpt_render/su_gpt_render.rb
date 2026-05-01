@@ -13,9 +13,32 @@ require 'time'
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.2.9"
+  PLUGIN_VERSION = "0.3.0"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
+
+  # Vision models for AI Watch (text+image → text). First entry = default.
+  WATCH_MODELS = [
+    ["Gemini-2.5-Flash",     "Gemini 2.5 Flash",   "Google · 平 + 快 · 推薦"],
+    ["Seed-2.0-Mini",        "Seed 2.0 Mini",      "ByteDance · 最便宜"],
+    ["Seed-2.0-Pro",         "Seed 2.0 Pro",       "ByteDance · flagship"],
+    ["Gemini-3.1-Pro",       "Gemini 3.1 Pro",     "Google · 最強 reasoning · 較貴"],
+    ["GPT-5.2",              "GPT-5.2",            "OpenAI 旗艦"],
+    ["GPT-4o",               "GPT-4o",             "OpenAI"],
+    ["Claude-Sonnet-4.5",    "Claude Sonnet 4.5",  "Anthropic"],
+    ["Claude-Opus-4.7",      "Claude Opus 4.7",    "Anthropic flagship"],
+    ["Qwen3-VL-235B-A22B-T", "Qwen 3-VL",          "阿里 · GUI-aware"],
+  ]
+
+  DEFAULT_WATCH_PROMPT = <<~P.strip
+    你係一個 senior interior designer，依家睇住有人喺 SketchUp 入面畫嘢。
+    用 2-3 句**繁體中文**簡單講：
+    1. 你見到佢喺度畫緊乜（櫃／房／傢俬／layout）
+    2. 有冇結構問題（unclosed face、奇怪比例、漏咗組件）
+    3. 一個實用 suggestion
+
+    保持簡短，香港裝修術語為佳。
+  P
 
   # Poe image models — image-editing only (accepts text+image → image).
   # Each: [poe_id, label, hint]. First entry is the default.
@@ -322,6 +345,224 @@ module SuGptRender
     out_path
   end
 
+  # Vision (text+image → text) — used by AI Watch. Returns the model's text answer.
+  def self.call_poe_text(api_key, image_path, prompt, model)
+    img_b64 = Base64.strict_encode64(File.binread(image_path))
+    payload = {
+      "model" => model,
+      "messages" => [{
+        "role" => "user",
+        "content" => [
+          { "type" => "text", "text" => prompt },
+          { "type" => "image_url",
+            "image_url" => { "url" => "data:image/png;base64,#{img_b64}" } }
+        ]
+      }],
+      "stream" => false
+    }
+    res = http_post_json(POE_ENDPOINT,
+      { "Authorization" => "Bearer #{api_key}", "Content-Type" => "application/json" },
+      JSON.generate(payload))
+    raise "Poe API HTTP #{res.code}: #{res.body[0,300]}" unless res.is_a?(Net::HTTPSuccess)
+    JSON.parse(res.body).dig("choices", 0, "message", "content").to_s
+  end
+
+  # ----- AI Watch ------------------------------------------------------------
+  class WatchObserver < Sketchup::ViewObserver
+    def onViewChanged(view)
+      SuGptRender.on_view_changed
+    rescue => e
+      puts "[GPT Render] onViewChanged err: #{e.message}"
+    end
+  end
+
+  def self.start_watching
+    cfg = load_config
+    return unless cfg["poe_api_key"].to_s.size > 0
+    return if @aiwatch[:enabled]
+    @aiwatch[:enabled] = true
+    @aiwatch[:observer] ||= WatchObserver.new
+    model = Sketchup.active_model
+    if model
+      view = model.active_view
+      view.add_observer(@aiwatch[:observer]) rescue nil
+    end
+    push_watch_state(true)
+    push_status("AI Watch: ON", "ok")
+    puts "[GPT Render] AI Watch started"
+  end
+
+  def self.stop_watching
+    return unless @aiwatch[:enabled]
+    @aiwatch[:enabled] = false
+    if @aiwatch[:pending_timer]
+      UI.stop_timer(@aiwatch[:pending_timer])
+      @aiwatch[:pending_timer] = nil
+    end
+    model = Sketchup.active_model
+    if model && @aiwatch[:observer]
+      model.active_view.remove_observer(@aiwatch[:observer]) rescue nil
+    end
+    push_watch_state(false)
+    push_status("AI Watch: OFF", "ok")
+    puts "[GPT Render] AI Watch stopped"
+  end
+
+  def self.toggle_watching
+    @aiwatch[:enabled] ? stop_watching : start_watching
+  end
+
+  def self.on_view_changed
+    return unless @aiwatch[:enabled]
+    cfg = load_config
+    delay = (cfg["watch_delay"] || 15).to_i.clamp(2, 600)
+    if @aiwatch[:pending_timer]
+      UI.stop_timer(@aiwatch[:pending_timer])
+    end
+    @aiwatch[:pending_timer] = UI.start_timer(delay, false) do
+      @aiwatch[:pending_timer] = nil
+      capture_and_analyze
+    end
+  end
+
+  def self.analyze_now
+    return unless load_config["poe_api_key"].to_s.size > 0
+    if @aiwatch[:pending_timer]
+      UI.stop_timer(@aiwatch[:pending_timer])
+      @aiwatch[:pending_timer] = nil
+    end
+    capture_and_analyze
+  end
+
+  def self.capture_and_analyze
+    return if @aiwatch[:bg_thread] && @aiwatch[:bg_thread].alive?
+    cfg = load_config
+    api_key = cfg["poe_api_key"].to_s
+    return if api_key.empty?
+
+    model = cfg["watch_model"] || WATCH_MODELS.first[0]
+    prompt = cfg["watch_prompt"] || DEFAULT_WATCH_PROMPT
+
+    # Smaller resolution for cheap polling
+    raw_path = nil
+    begin
+      raw_path = export_view_for_watch(800, 600)
+    rescue => e
+      push_watch_status("Capture failed: #{e.message}", "err")
+      return
+    end
+
+    push_watch_status("Analyzing (#{model})...", "busy")
+    started = Time.now
+
+    @aiwatch[:bg_thread] = Thread.new do
+      begin
+        text = call_poe_text(api_key, raw_path, prompt, model)
+        Thread.current[:result] = { ok: true, text: text, raw: raw_path,
+                                    model: model, started: started }
+      rescue => e
+        Thread.current[:result] = { ok: false, error: e.message, raw: raw_path }
+      end
+    end
+
+    @aiwatch[:bg_poll_timer] = UI.start_timer(0.5, true) do
+      if @aiwatch[:bg_thread] && !@aiwatch[:bg_thread].alive?
+        UI.stop_timer(@aiwatch[:bg_poll_timer]) if @aiwatch[:bg_poll_timer]
+        @aiwatch[:bg_poll_timer] = nil
+        result = @aiwatch[:bg_thread][:result]
+        @aiwatch[:bg_thread] = nil
+        if result[:ok]
+          elapsed = (Time.now - result[:started]).round(1)
+          log_observation(result[:raw], result[:text], result[:model], elapsed)
+          push_watch_observation(result[:raw], result[:text], result[:model], elapsed)
+          push_watch_status("Watching (last: #{elapsed}s)", "ok")
+        else
+          push_watch_status("Watch failed: #{result[:error][0,80]}", "err")
+        end
+      end
+    end
+  end
+
+  def self.export_view_for_watch(width, height)
+    model = Sketchup.active_model
+    raise "No model" unless model
+    base = model.path.empty? ? "Untitled" : File.basename(model.path, ".skp")
+    base = base.gsub(/[^\w一-鿿\-]/, "_")
+    timestamp = Time.now.strftime("%Y%m%d_%H%M%S")
+    out_dir = if model.path.empty?
+                File.expand_path("~/Desktop/gpt_render/watch")
+              else
+                File.join(File.dirname(model.path), "gpt_render", "watch")
+              end
+    FileUtils.mkdir_p(out_dir)
+    out_path = File.join(out_dir, "#{timestamp}_#{base}_watch.png")
+    success = model.active_view.write_image(filename: out_path, width: width,
+                                            height: height, antialias: false,
+                                            transparent: false)
+    raise "write_image failed" unless success
+    out_path
+  end
+
+  def self.log_observation(raw_path, text, model, elapsed)
+    dir = File.dirname(raw_path)
+    log_path = File.join(dir, "ai_watch_#{Time.now.strftime('%Y%m%d')}.jsonl")
+    entry = {
+      "ts" => Time.now.iso8601,
+      "model" => model,
+      "elapsed_sec" => elapsed,
+      "image" => File.basename(raw_path),
+      "text" => text,
+    }
+    File.open(log_path, "a") { |f| f.puts JSON.generate(entry) }
+    # Bump today's count for cost meter
+    bump_watch_count
+  end
+
+  def self.bump_watch_count
+    cfg = load_config
+    cfg["watch_counts"] ||= {}
+    today = Time.now.strftime("%Y-%m-%d")
+    cfg["watch_counts"][today] = (cfg["watch_counts"][today] || 0) + 1
+    save_config(cfg)
+  end
+
+  def self.watch_count_today
+    cfg = load_config
+    today = Time.now.strftime("%Y-%m-%d")
+    (cfg["watch_counts"] || {})[today] || 0
+  end
+
+  # Rough cost estimate per call by model. Real billing varies; this is just for
+  # the display on the tray (so user can see if cost is exploding).
+  WATCH_COST_PER_CALL = {
+    "Gemini-2.5-Flash"      => 0.0015,
+    "Seed-2.0-Mini"         => 0.0008,
+    "Seed-2.0-Pro"          => 0.0040,
+    "Gemini-3.1-Pro"        => 0.0150,
+    "GPT-5.2"               => 0.0150,
+    "GPT-4o"                => 0.0080,
+    "Claude-Sonnet-4.5"     => 0.0080,
+    "Claude-Opus-4.7"       => 0.0250,
+    "Qwen3-VL-235B-A22B-T"  => 0.0036,
+  }.freeze
+
+  def self.estimated_cost_today
+    n = watch_count_today
+    cfg = load_config
+    rate = WATCH_COST_PER_CALL[cfg["watch_model"] || WATCH_MODELS.first[0]] || 0.005
+    (n * rate).round(4)
+  end
+
+  # Recent watch observations from today's JSONL log
+  def self.recent_observations(limit = 30)
+    dir = history_dir
+    return [] unless dir
+    log_path = File.join(dir, "watch", "ai_watch_#{Time.now.strftime('%Y%m%d')}.jsonl")
+    return [] unless File.exist?(log_path)
+    lines = File.readlines(log_path).reverse
+    lines.first(limit).map { |l| JSON.parse(l) rescue nil }.compact
+  end
+
   # ------ tray dialog --------------------------------------------------------
   # Use ||= so that `load __FILE__` (hot-reload) preserves these references.
   # If we used = the load would reset @tray to nil and we'd lose the live dialog.
@@ -332,6 +573,14 @@ module SuGptRender
   @recurring_update_timer ||= nil
   @update_thread         ||= nil
   @update_poll_timer     ||= nil
+  # AI Watch state
+  @aiwatch               ||= {
+    enabled:        false,
+    pending_timer:  nil,
+    observer:       nil,
+    bg_thread:      nil,
+    bg_poll_timer:  nil,
+  }
 
   def self.tray_html
     cfg = load_config
@@ -342,6 +591,18 @@ module SuGptRender
     selected_model = cfg["model"] || IMAGE_MODELS.first[0]
     history_html = render_history_html
     history_count = count_history
+
+    # AI Watch state for HTML
+    aiw_enabled = @aiwatch && @aiwatch[:enabled] ? true : false
+    aiw_model = cfg["watch_model"] || WATCH_MODELS.first[0]
+    aiw_delay = cfg["watch_delay"] || 15
+    aiw_today = watch_count_today
+    aiw_cost = estimated_cost_today
+    aiw_feed_html = render_watch_feed_html
+    aiw_model_options = WATCH_MODELS.map { |id, label, hint|
+      sel = (id == aiw_model) ? " selected" : ""
+      "<option value=\"#{id}\"#{sel}>#{CGI.escapeHTML(label)} — #{CGI.escapeHTML(hint)}</option>"
+    }.join("\n")
 
     model_options_html = IMAGE_MODELS.map { |id, label, hint|
       sel = (id == selected_model) ? " selected" : ""
@@ -414,6 +675,19 @@ module SuGptRender
         .tpl-item .tag.user { background:#246; color:#cdf; }
         .tpl-item .tag.tweak { background:#642; color:#fcb; }
         .tpl-item .dim { opacity:.55; font-size:10px; font-weight:400; margin-right:4px; }
+        /* AI Watch */
+        .aiw-status { padding:6px 12px; border-radius:14px; font-size:12px; display:inline-block; margin-bottom:10px; font-weight:600; }
+        .aiw-status.on  { background:#1c4; color:#fff; box-shadow:0 0 12px rgba(28,200,80,.5); animation:pulse 2s infinite; }
+        .aiw-status.off { background:#444; color:#bbb; }
+        @keyframes pulse { 0%,100% { box-shadow:0 0 8px rgba(28,200,80,.4); } 50% { box-shadow:0 0 18px rgba(28,200,80,.8); } }
+        .aiw-feed { max-height:none; }
+        .aiw-feed .empty-history { padding:24px 20px; text-align:center; opacity:.5; }
+        .aiw-item { display:flex; gap:10px; padding:10px; margin-bottom:8px; background:#222; border-radius:6px; border-left:3px solid #2c80c0; }
+        .aiw-item img { width:96px; height:64px; object-fit:cover; border-radius:3px; cursor:pointer; flex-shrink:0; }
+        .aiw-item .aiw-meta { flex:1; min-width:0; }
+        .aiw-item .aiw-when { font-size:11px; opacity:.7; margin-bottom:4px; }
+        .aiw-item .aiw-when .model { color:#7cf; margin-left:6px; }
+        .aiw-item .aiw-text { font-size:12.5px; line-height:1.45; color:#eee; }
         .small-btns { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px; }
         .info-grid { display:grid; grid-template-columns: auto 1fr; gap:4px 12px; padding:8px 10px; background:#222; border-radius:4px; font-size:11px; margin-bottom:10px; }
         .info-grid div:nth-child(odd) { opacity:.6; }
@@ -443,6 +717,7 @@ module SuGptRender
           <button id="mt_render"  class="active" onclick="switchMainTab('render')">Render</button>
           <button id="mt_prompts" onclick="switchMainTab('prompts')">Prompts</button>
           <button id="mt_history" onclick="switchMainTab('history')">History <span class="badge" id="hist_count">#{history_count}</span></button>
+          <button id="mt_aiwatch" onclick="switchMainTab('aiwatch')">AI Watch <span class="badge" id="aiw_dot">#{aiw_enabled ? '●' : ''}</span></button>
         </div>
 
         <!-- ========== Render tab ========== -->
@@ -502,6 +777,47 @@ module SuGptRender
           <div id="templates_list">#{render_templates_html}</div>
           <h3>Recent prompts (from your past renders)</h3>
           <div id="recent_prompts">#{render_recent_prompts_html}</div>
+        </div>
+
+        <!-- ========== AI Watch tab ========== -->
+        <div id="aiwatch_pane" class="pane">
+          <div id="aiw_status" class="aiw-status #{aiw_enabled ? 'on' : 'off'}">
+            #{aiw_enabled ? '● Watching' : '○ Off'}
+          </div>
+          <div class="row">
+            <button id="aiw_btn" class="primary" style="width:100%" onclick="toggleWatch()">
+              #{aiw_enabled ? '■ Stop Watching' : '▶ Start Watching'}
+            </button>
+          </div>
+
+          <div class="grid row">
+            <label>Trigger after view settles
+              <select id="aiw_delay" onchange="setWatchDelay()">
+                <option value="5"  #{aiw_delay == 5  ? 'selected' : ''}>5s</option>
+                <option value="15" #{aiw_delay == 15 ? 'selected' : ''}>15s</option>
+                <option value="30" #{aiw_delay == 30 ? 'selected' : ''}>30s</option>
+                <option value="60" #{aiw_delay == 60 ? 'selected' : ''}>1 min</option>
+                <option value="180" #{aiw_delay == 180 ? 'selected' : ''}>3 min</option>
+              </select>
+            </label>
+            <label>Vision model
+              <select id="aiw_model" onchange="setWatchModel()">#{aiw_model_options}</select>
+            </label>
+          </div>
+
+          <div class="small-btns">
+            <button class="small" onclick="cmd('analyze_now')">▷ Analyze now</button>
+            <button class="small" onclick="cmd('edit_watch_prompt')">Watch Prompt</button>
+            <button class="small" onclick="cmd('open_watch_log')">Open log</button>
+          </div>
+
+          <div class="info-grid">
+            <div>Today</div><div id="aiw_today">#{aiw_today} analyses · ~$#{format('%.2f', aiw_cost)}</div>
+            <div>Output dir</div><div><code>&lt;model&gt;/gpt_render/watch/</code></div>
+          </div>
+
+          <h3>Live feed</h3>
+          <div class="aiw-feed" id="aiw_feed">#{aiw_feed_html}</div>
         </div>
 
         <!-- ========== History tab ========== -->
@@ -571,12 +887,36 @@ module SuGptRender
           }
         }
         function switchMainTab(name) {
-          ['render','prompts','history'].forEach(n => {
+          ['render','prompts','history','aiwatch'].forEach(n => {
             const tabBtn = document.getElementById('mt_' + n);
             const pane = document.getElementById(n + '_pane');
             if (tabBtn) tabBtn.classList.toggle('active', name === n);
             if (pane) pane.classList.toggle('active', name === n);
           });
+        }
+        function toggleWatch() { sketchup.toggle_watch(''); }
+        function setWatchDelay() { sketchup.set_watch_delay(document.getElementById('aiw_delay').value); }
+        function setWatchModel() { sketchup.set_watch_model(document.getElementById('aiw_model').value); }
+        function setWatchUI(enabled, statusText, statusCls) {
+          const btn = document.getElementById('aiw_btn');
+          const dot = document.getElementById('aiw_dot');
+          const stat = document.getElementById('aiw_status');
+          if (btn) btn.textContent = enabled ? '■ Stop Watching' : '▶ Start Watching';
+          if (dot) dot.textContent = enabled ? '●' : '';
+          if (stat) {
+            stat.textContent = enabled ? '● Watching' : '○ Off';
+            stat.className = 'aiw-status ' + (enabled ? 'on' : 'off');
+          }
+          if (statusText) {
+            const s = document.getElementById('status');
+            if (s) { s.textContent = statusText; s.className = statusCls || ''; }
+          }
+        }
+        function setWatchFeed(html, todayCount, todayCost) {
+          const f = document.getElementById('aiw_feed');
+          if (f) f.innerHTML = html;
+          const t = document.getElementById('aiw_today');
+          if (t) t.textContent = todayCount + ' analyses · ~$' + todayCost;
         }
         function useTpl(id) { sketchup.use_template(id); }
         function deleteTpl(id) {
@@ -636,6 +976,26 @@ module SuGptRender
           </div>
           <button class='small' onclick="useTpl(#{t['id'].to_json})">Use</button>
           #{del_btn}
+        </div>
+      HTML
+    }.join("\n")
+  end
+
+  def self.render_watch_feed_html
+    items = recent_observations(30)
+    return "<div class='empty-history'><div class='icon'>👁</div><div>No observations yet</div><div style='font-size:11px;margin-top:6px'>Start watching, the AI will comment as you work</div></div>" if items.empty?
+    items.map { |o|
+      img_path = File.join(history_dir || "", "watch", o["image"].to_s)
+      img_url = File.exist?(img_path) ? "file://" + img_path.gsub("\\", "/") : ""
+      ts = o["ts"].to_s
+      time_label = ts.length >= 16 ? ts[11,8] : ts
+      <<~HTML
+        <div class='aiw-item'>
+          <img src="#{img_url}" onclick="sketchup.open_file(#{img_path.to_json})">
+          <div class='aiw-meta'>
+            <div class='aiw-when'>#{time_label} <span class='model'>#{CGI.escapeHTML(o['model'].to_s)}</span> <span class='dim'>#{o['elapsed_sec']}s</span></div>
+            <div class='aiw-text'>#{CGI.escapeHTML(o['text'].to_s).gsub("\n", '<br>')}</div>
+          </div>
         </div>
       HTML
     }.join("\n")
@@ -863,6 +1223,25 @@ module SuGptRender
         refresh_tray
       end
     end
+    # AI Watch callbacks
+    @tray.add_action_callback("toggle_watch")     { |_, _| toggle_watching }
+    @tray.add_action_callback("analyze_now")      { |_, _| analyze_now }
+    @tray.add_action_callback("set_watch_delay")  do |_, v|
+      cfg = load_config; cfg["watch_delay"] = v.to_i; save_config(cfg)
+    end
+    @tray.add_action_callback("set_watch_model")  do |_, v|
+      cfg = load_config; cfg["watch_model"] = v.to_s; save_config(cfg)
+    end
+    @tray.add_action_callback("edit_watch_prompt") { |_, _| edit_watch_prompt }
+    @tray.add_action_callback("open_watch_log")   do |_, _|
+      dir = history_dir
+      if dir
+        watch_dir = File.join(dir, "watch")
+        FileUtils.mkdir_p(watch_dir)
+        UI.openURL("file://" + watch_dir.gsub("\\", "/"))
+      end
+    end
+
     @tray.add_action_callback("save_recent_as_template") do |_, idx|
       r = recent_prompts[idx.to_i]
       next unless r
@@ -962,6 +1341,68 @@ module SuGptRender
   def self.push_prompts
     return unless @tray && @tray.visible?
     @tray.execute_script("setPromptsHTML(#{render_templates_html.to_json}, #{render_recent_prompts_html.to_json})")
+  end
+
+  def self.push_watch_state(enabled)
+    return unless @tray && @tray.visible?
+    @tray.execute_script("setWatchUI(#{enabled ? 'true' : 'false'})")
+  end
+
+  def self.push_watch_status(msg, cls = "")
+    push_status(msg, cls)
+  end
+
+  def self.push_watch_observation(raw_path, text, model, elapsed)
+    return unless @tray && @tray.visible?
+    @tray.execute_script("setWatchFeed(#{render_watch_feed_html.to_json}, #{watch_count_today}, '#{format('%.2f', estimated_cost_today)}')")
+  end
+
+  # Edit the watch prompt in a multiline HtmlDialog (similar to render prompt)
+  def self.edit_watch_prompt
+    cfg = load_config
+    current = cfg["watch_prompt"] || DEFAULT_WATCH_PROMPT
+    dlg = UI::HtmlDialog.new(
+      dialog_title:    "#{PLUGIN_NAME} — Edit Watch Prompt",
+      preferences_key: "su_gpt_render_watch_prompt_dlg",
+      scrollable:      true, resizable: true,
+      width: 640, height: 540,
+      style: UI::HtmlDialog::STYLE_DIALOG
+    )
+    cur_html = CGI.escapeHTML(current)
+    default_html = CGI.escapeHTML(DEFAULT_WATCH_PROMPT).gsub("\n", '\\n').gsub("'", "\\\\'")
+    html = <<~HTML
+      <!doctype html><html><head><meta charset="utf-8">
+      <style>
+        body { font-family:-apple-system,"Helvetica Neue","PingFang HK","Microsoft JhengHei",sans-serif; margin:0; padding:14px; background:#f5f5f5; }
+        h2 { margin:0 0 8px 0; font-size:14px; color:#333; }
+        p.hint { margin:0 0 10px 0; font-size:12px; color:#666; line-height:1.4; }
+        textarea { width:100%; min-height:340px; box-sizing:border-box; font-family:"SF Mono",Consolas,monospace; font-size:12.5px; padding:10px; border:1px solid #ccc; border-radius:4px; resize:vertical; }
+        .row { margin-top:10px; display:flex; gap:8px; }
+        button { padding:8px 14px; border:1px solid #aaa; border-radius:4px; background:#fff; cursor:pointer; font-size:13px; }
+        button.primary { background:#2c80c0; color:#fff; border-color:#2c80c0; }
+        button.danger { color:#a00; border-color:#caa; }
+        .spacer { flex:1; }
+      </style></head><body>
+      <h2>AI Watch prompt</h2>
+      <p class="hint">每次自動 capture 都會用呢個 prompt。可以叫 AI focus 喺 cabinet construction、material choice、proportions 等。</p>
+      <textarea id="prompt">#{cur_html}</textarea>
+      <div class="row">
+        <button class="primary" onclick="window.location='skp:save@'+encodeURIComponent(document.getElementById('prompt').value)">Save</button>
+        <button onclick="window.location='skp:cancel@'">Cancel</button>
+        <div class="spacer"></div>
+        <button class="danger" onclick="if(confirm('Reset?')){document.getElementById('prompt').value='#{default_html}';}">Reset</button>
+      </div>
+      </body></html>
+    HTML
+    dlg.set_html(html)
+    dlg.add_action_callback("save") do |_, value|
+      decoded = CGI.unescape(value.to_s)
+      cfg2 = load_config; cfg2["watch_prompt"] = decoded; save_config(cfg2)
+      dlg.close
+      UI.messagebox("Watch prompt saved (#{decoded.length} chars).")
+    end
+    dlg.add_action_callback("cancel") { |_, _| dlg.close }
+    dlg.show
   end
 
   # ------ async render -------------------------------------------------------

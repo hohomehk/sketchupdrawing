@@ -1,5 +1,5 @@
 {
-  "version": "0.2.9",
+  "version": "0.3.0",
   "rb_url": "https://raw.githubusercontent.com/hohomehk/sketchupdrawing/main/sketchup_plugin/su_gpt_render/su_gpt_render.rb",
-  "notes": "v0.2.9 — Fix: silent auto-update did not refresh tray UI in place because `@tray = nil` at module top reset the reference whenever `load __FILE__` re-ran the body. Now uses `@tray ||= nil` (preserves) + saves reference around the load + uses HtmlDialog#set_html for true in-place HTML refresh. No more flicker, no more requiring you to close and reopen the tray after an update."
+  "notes": "v0.3.0 — NEW: AI Watch tab. AI sits in the background while you draw and gives feedback every N seconds. ViewObserver-based debounced capture (5/15/30/60s after view settles) → POST to Poe vision model (Gemini 2.5 Flash default) → live observation feed in tray. 9 watch models incl. Seed-2.0-Mini for cheapest, Claude Opus 4.7 for deepest analysis. Daily cost meter, persistent JSONL log per day. Custom watch prompt separate from render prompt."
 }

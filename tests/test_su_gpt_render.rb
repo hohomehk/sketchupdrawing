@@ -522,6 +522,150 @@ class TestPromptHistory < Minitest::Test
   end
 end
 
+class TestAiWatch < Minitest::Test
+  def setup
+    File.delete(TEST_CFG_PATH) if File.exist?(TEST_CFG_PATH)
+    @tmp_dir = Dir.mktmpdir("test_aiwatch")
+    @model = Sketchup.active_model
+    @model.path = File.join(@tmp_dir, "test.skp")
+    File.binwrite(@model.path, "fake")
+    SuGptRender.save_config({"poe_api_key" => "TEST_KEY", "watch_delay" => 5})
+    SuGptRender.instance_variable_set(:@aiwatch, {
+      enabled: false, pending_timer: nil, observer: nil,
+      bg_thread: nil, bg_poll_timer: nil
+    })
+  end
+
+  def teardown
+    FileUtils.remove_entry(@tmp_dir) if @tmp_dir
+    Sketchup.reset_model!
+  end
+
+  def test_watch_models_constant
+    assert SuGptRender::WATCH_MODELS.length >= 5
+    assert_equal "Gemini-2.5-Flash", SuGptRender::WATCH_MODELS.first[0]
+  end
+
+  def test_default_watch_prompt_present
+    assert SuGptRender::DEFAULT_WATCH_PROMPT.length > 50
+    assert SuGptRender::DEFAULT_WATCH_PROMPT.include?("SketchUp")
+  end
+
+  def test_start_watching_sets_enabled
+    SuGptRender.start_watching
+    assert SuGptRender.instance_variable_get(:@aiwatch)[:enabled]
+  end
+
+  def test_start_watching_skipped_without_api_key
+    SuGptRender.save_config({})  # no poe_api_key
+    SuGptRender.start_watching
+    refute SuGptRender.instance_variable_get(:@aiwatch)[:enabled]
+  end
+
+  def test_stop_watching_clears
+    SuGptRender.start_watching
+    SuGptRender.stop_watching
+    refute SuGptRender.instance_variable_get(:@aiwatch)[:enabled]
+  end
+
+  def test_toggle_watching
+    SuGptRender.toggle_watching
+    assert SuGptRender.instance_variable_get(:@aiwatch)[:enabled]
+    SuGptRender.toggle_watching
+    refute SuGptRender.instance_variable_get(:@aiwatch)[:enabled]
+  end
+
+  def test_on_view_changed_schedules_timer
+    SuGptRender.start_watching
+    UI.reset!
+    SuGptRender.on_view_changed
+    assert_equal 1, UI.timers.length
+    timer_id, t = UI.timers.first
+    assert_equal 5, t[:seconds]
+    refute t[:repeat]
+  end
+
+  def test_on_view_changed_debounces
+    SuGptRender.start_watching
+    UI.reset!
+    SuGptRender.on_view_changed
+    SuGptRender.on_view_changed   # second call should cancel + reschedule
+    SuGptRender.on_view_changed
+    # After 3 rapid calls, only the most recent timer should be pending
+    pending = SuGptRender.instance_variable_get(:@aiwatch)[:pending_timer]
+    assert pending, "pending timer set"
+    # And UI.timers should reflect it (might have residue but the live one is set)
+  end
+
+  def test_watch_count_today_persists
+    SuGptRender.bump_watch_count
+    SuGptRender.bump_watch_count
+    assert_equal 2, SuGptRender.watch_count_today
+  end
+
+  def test_estimated_cost_today
+    SuGptRender.save_config({"watch_model" => "Gemini-2.5-Flash"})
+    3.times { SuGptRender.bump_watch_count }
+    cost = SuGptRender.estimated_cost_today
+    assert_in_delta 0.0045, cost, 0.001
+  end
+
+  def test_log_observation_writes_jsonl
+    raw_path = File.join(@tmp_dir, "gpt_render", "watch", "20260502_120000_test_watch.png")
+    FileUtils.mkdir_p(File.dirname(raw_path))
+    File.binwrite(raw_path, "FAKE")
+    SuGptRender.log_observation(raw_path, "AI says: looks good", "Gemini-2.5-Flash", 1.4)
+    log_file = File.join(@tmp_dir, "gpt_render", "watch", "ai_watch_#{Time.now.strftime('%Y%m%d')}.jsonl")
+    assert File.exist?(log_file)
+    line = File.readlines(log_file).first
+    parsed = JSON.parse(line)
+    assert_equal "Gemini-2.5-Flash", parsed["model"]
+    assert_equal 1.4, parsed["elapsed_sec"]
+    assert parsed["text"].include?("looks good")
+  end
+
+  def test_recent_observations_returns_in_reverse_order
+    raw_path1 = File.join(@tmp_dir, "gpt_render", "watch", "a.png")
+    raw_path2 = File.join(@tmp_dir, "gpt_render", "watch", "b.png")
+    FileUtils.mkdir_p(File.dirname(raw_path1))
+    File.binwrite(raw_path1, "x"); File.binwrite(raw_path2, "x")
+    SuGptRender.log_observation(raw_path1, "first", "Gemini-2.5-Flash", 1.0)
+    sleep 0.01
+    SuGptRender.log_observation(raw_path2, "second", "Gemini-2.5-Flash", 1.0)
+    obs = SuGptRender.recent_observations(10)
+    assert_equal "second", obs.first["text"]   # newest first
+    assert_equal 2, obs.length
+  end
+end
+
+class TestCallPoeText < Minitest::Test
+  def setup
+    SuGptRender.stub_responses = nil
+    SuGptRender.stub_calls = []
+    @tmpimg = Tempfile.new(["w", ".png"])
+    @tmpimg.binmode; @tmpimg.write("\x89PNG" + "x" * 64); @tmpimg.close
+  end
+  def teardown; @tmpimg.unlink if @tmpimg; end
+
+  def test_returns_text_content
+    response = JSON.generate({
+      "choices" => [{ "message" => { "role" => "assistant",
+        "content" => "Looks like a wardrobe. Suggest checking proportions." } }]
+    })
+    SuGptRender.stub_responses = { "*" => FakeHttpResponse.new(200, response) }
+    text = SuGptRender.call_poe_text("KEY", @tmpimg.path, "describe", "Gemini-2.5-Flash")
+    assert text.include?("wardrobe")
+  end
+
+  def test_raises_on_http_error
+    SuGptRender.stub_responses = { "*" => FakeHttpResponse.new(500, '{"error":"oops"}') }
+    err = assert_raises(RuntimeError) {
+      SuGptRender.call_poe_text("KEY", @tmpimg.path, "p", "Gemini-2.5-Flash")
+    }
+    assert err.message.include?("HTTP 500")
+  end
+end
+
 class TestImageModelList < Minitest::Test
   def test_no_t2i_models
     SuGptRender::IMAGE_MODELS.each do |entry|

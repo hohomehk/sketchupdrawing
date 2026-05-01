@@ -58,14 +58,21 @@ module Sketchup
   end
 
   class ViewStub
-    attr_reader :write_image_calls
-    def initialize; @write_image_calls = []; end
+    attr_reader :write_image_calls, :observers
+    def initialize; @write_image_calls = []; @observers = []; end
     def write_image(opts)
       @write_image_calls << opts
       File.binwrite(opts[:filename], "FAKE_PNG_BYTES")
       true
     end
     def refresh; end
+    def add_observer(o); @observers << o; end
+    def remove_observer(o); @observers.delete(o); end
+  end
+
+  # Minimal abstract base class for ViewObserver. The plugin subclasses this.
+  class ViewObserver
+    def onViewChanged(view); end
   end
 end
 
