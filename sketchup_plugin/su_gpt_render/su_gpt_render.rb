@@ -12,7 +12,7 @@ require 'openssl'
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.2.5"
+  PLUGIN_VERSION = "0.2.6"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -232,6 +232,7 @@ module SuGptRender
     height = cfg["height"] || 1024
     selected_model = cfg["model"] || IMAGE_MODELS.first[0]
     history_html = render_history_html
+    history_count = count_history
 
     model_options_html = IMAGE_MODELS.map { |id, label, hint|
       sel = (id == selected_model) ? " selected" : ""
@@ -268,9 +269,27 @@ module SuGptRender
         .preview:hover .hint { opacity:1; }
         .preview .empty { padding:20px; text-align:center; opacity:.4; font-size:11px; }
         select { background:#2a2a2a; color:#eee; border:1px solid #3a3a3a; padding:5px 8px; border-radius:4px; width:100%; font-size:13px; }
+        /* sub-tabs (Enhanced/Raw) */
         .tabs { display:flex; gap:4px; margin-bottom:6px; }
         .tabs button { padding:5px 10px; font-size:11px; background:#222; }
         .tabs button.active { background:#2c80c0; }
+        /* main top-level tabs (Render/History) */
+        .maintabs { display:flex; gap:0; margin:0 -12px 12px -12px; padding:0 12px; border-bottom:1px solid #2a2a2a; }
+        .maintabs button { background:transparent; border:none; border-bottom:2px solid transparent; padding:9px 14px; color:#888; font-size:13px; font-weight:500; border-radius:0; cursor:pointer; }
+        .maintabs button.active { color:#fff; border-bottom-color:#2c80c0; }
+        .maintabs button:hover:not(.active) { color:#bbb; }
+        .maintabs button .badge { display:inline-block; background:#3a3a3a; color:#bbb; font-size:10px; padding:1px 6px; border-radius:8px; margin-left:6px; }
+        .maintabs button.active .badge { background:#2c80c0; color:#fff; }
+        .pane { display:none; }
+        .pane.active { display:block; }
+        /* History pane bigger thumbs */
+        #history_pane .history { max-height:none; }
+        #history_pane .history img { width:96px; height:64px; }
+        #history_pane .history .item { padding:8px 0; }
+        #history_pane .history .meta .ts { font-size:13px; }
+        #history_pane .history .meta .sub { font-size:11px; }
+        #history_pane .empty-history { padding:40px 20px; text-align:center; opacity:.5; }
+        #history_pane .empty-history .icon { font-size:32px; margin-bottom:10px; }
         .small-btns { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px; }
         .info-grid { display:grid; grid-template-columns: auto 1fr; gap:4px 12px; padding:8px 10px; background:#222; border-radius:4px; font-size:11px; margin-bottom:10px; }
         .info-grid div:nth-child(odd) { opacity:.6; }
@@ -296,53 +315,67 @@ module SuGptRender
 
         <div id="upd"></div>
 
-        <div id="status">Ready · API key #{has_key ? "✓" : "<span style='color:#fa6'>not set</span>"}</div>
-
-        <div class="row">
-          <label style="font-size:11px;opacity:.7;display:block;margin-bottom:3px">Model</label>
-          <select id="model" onchange="onModelChange()">
-            #{model_options_html}
-          </select>
+        <div class="maintabs">
+          <button id="mt_render"  class="active" onclick="switchMainTab('render')">Render</button>
+          <button id="mt_history" onclick="switchMainTab('history')">History <span class="badge" id="hist_count">#{history_count}</span></button>
         </div>
 
-        <div class="row">
-          <button id="renderBtn" class="primary" style="width:100%" onclick="doRender()">Render Current View</button>
+        <!-- ========== Render tab ========== -->
+        <div id="render_pane" class="pane active">
+          <div id="status">Ready · API key #{has_key ? "✓" : "<span style='color:#fa6'>not set</span>"}</div>
+
+          <div class="row">
+            <label style="font-size:11px;opacity:.7;display:block;margin-bottom:3px">Model</label>
+            <select id="model" onchange="onModelChange()">
+              #{model_options_html}
+            </select>
+          </div>
+
+          <div class="row">
+            <button id="renderBtn" class="primary" style="width:100%" onclick="doRender()">Render Current View</button>
+          </div>
+
+          <div class="grid row">
+            <label>Width <input id="w" type="number" value="#{width}"></label>
+            <label>Height <input id="h" type="number" value="#{height}"></label>
+          </div>
+
+          <div class="info-grid">
+            <div>Prompt</div><div>#{prompt_chars} chars saved</div>
+            <div>Output</div><div><code>&lt;model&gt;/gpt_render/</code></div>
+          </div>
+
+          <div class="small-btns">
+            <button class="small" onclick="cmd('edit_prompt')">Edit Prompt</button>
+            <button class="small" onclick="cmd('set_key')">API Key</button>
+            <button class="small" onclick="cmd('check_update')">Check Update</button>
+            <button class="small" onclick="cmd('open_folder')">Open Folder</button>
+          </div>
+
+          <h3>Latest result</h3>
+          <div class="tabs">
+            <button id="tab_enh" class="active" onclick="switchTab('enh')">Enhanced</button>
+            <button id="tab_raw" onclick="switchTab('raw')">Raw render</button>
+          </div>
+          <div class="preview">
+            <div id="preview_empty" class="empty">Render 完會喺度顯示</div>
+            <img id="preview_img" style="display:none" onclick="openCurrentImage()">
+            <div class="hint">🔍 click to open full size</div>
+          </div>
+          <div class="small-btns" id="refine_row" style="display:none">
+            <button class="small" onclick="refineCurrent()" title="用呢張結果做 input 再 render，加 tweak 指示">↻ Refine this</button>
+            <button class="small" onclick="openCurrentImage()">Open full size</button>
+          </div>
         </div>
 
-        <div class="grid row">
-          <label>Width <input id="w" type="number" value="#{width}"></label>
-          <label>Height <input id="h" type="number" value="#{height}"></label>
+        <!-- ========== History tab ========== -->
+        <div id="history_pane" class="pane">
+          <div class="small-btns">
+            <button class="small" onclick="cmd('open_folder')">Open Folder</button>
+            <button class="small" onclick="cmd('refresh_history')">Refresh</button>
+          </div>
+          <div class="history" id="history">#{history_html}</div>
         </div>
-
-        <div class="info-grid">
-          <div>Prompt</div><div>#{prompt_chars} chars saved</div>
-          <div>Output</div><div><code>&lt;model&gt;/gpt_render/</code></div>
-        </div>
-
-        <div class="small-btns">
-          <button class="small" onclick="cmd('edit_prompt')">Edit Prompt</button>
-          <button class="small" onclick="cmd('set_key')">API Key</button>
-          <button class="small" onclick="cmd('check_update')">Check Update</button>
-          <button class="small" onclick="cmd('open_folder')">Open Folder</button>
-        </div>
-
-        <h3>Latest result</h3>
-        <div class="tabs">
-          <button id="tab_enh" class="active" onclick="switchTab('enh')">Enhanced</button>
-          <button id="tab_raw" onclick="switchTab('raw')">Raw render</button>
-        </div>
-        <div class="preview">
-          <div id="preview_empty" class="empty">Render 完會喺度顯示</div>
-          <img id="preview_img" style="display:none" onclick="openCurrentImage()">
-          <div class="hint">🔍 click to open full size</div>
-        </div>
-        <div class="small-btns" id="refine_row" style="display:none">
-          <button class="small" onclick="refineCurrent()" title="用呢張結果做 input 再 render，加 tweak 指示">↻ Refine this</button>
-          <button class="small" onclick="openCurrentImage()">Open full size</button>
-        </div>
-
-        <h3>History</h3>
-        <div class="history" id="history">#{history_html}</div>
 
         <script>
         let lastRaw = null, lastEnh = null, currentTab = 'enh', lastRawPath = null, lastEnhPath = null;
@@ -395,8 +428,17 @@ module SuGptRender
           el.innerHTML = '⚠ New version ' + version + ' available. <a href="#" onclick="cmd(\\'download_update\\');return false;" style="color:#fa6">Update now</a><br><small>' + (notes||'') + '</small>';
           el.classList.add('show');
         }
-        function setHistory(html) {
+        function setHistory(html, count) {
           document.getElementById('history').innerHTML = html;
+          if (typeof count === 'number') {
+            document.getElementById('hist_count').textContent = count;
+          }
+        }
+        function switchMainTab(name) {
+          document.getElementById('mt_render').classList.toggle('active', name === 'render');
+          document.getElementById('mt_history').classList.toggle('active', name === 'history');
+          document.getElementById('render_pane').classList.toggle('active', name === 'render');
+          document.getElementById('history_pane').classList.toggle('active', name === 'history');
         }
         function doRender() {
           const opts = {
@@ -425,11 +467,23 @@ module SuGptRender
     HTML
   end
 
+  def self.history_dir
+    model = Sketchup.active_model
+    return nil if model.nil? || model.path.empty?
+    File.join(File.dirname(model.path), "gpt_render")
+  end
+
+  def self.count_history
+    dir = history_dir
+    return 0 unless dir && File.directory?(dir)
+    Dir.glob(File.join(dir, "*_raw.png")).length
+  end
+
   def self.render_history_html
     model = Sketchup.active_model
-    return "<div class='empty' style='padding:8px;opacity:.5'>Save your model first</div>" if model.nil? || model.path.empty?
+    return "<div class='empty-history'><div class='icon'>📁</div><div>Save your model first</div><div style='font-size:11px;margin-top:6px'>(File → Save the .skp before rendering)</div></div>" if model.nil? || model.path.empty?
     dir = File.join(File.dirname(model.path), "gpt_render")
-    return "<div class='empty' style='padding:8px;opacity:.5'>No renders yet</div>" unless File.directory?(dir)
+    return "<div class='empty-history'><div class='icon'>🎨</div><div>No renders yet</div><div style='font-size:11px;margin-top:6px'>Render a view first to start building history</div></div>" unless File.directory?(dir)
 
     pairs = {}
     Dir.glob(File.join(dir, "*_raw.png")).each do |raw|
@@ -443,8 +497,8 @@ module SuGptRender
       pairs[stem] = { raw: raw, enh: File.exist?(enh) ? enh : nil, meta: meta }
     end
 
-    items = pairs.keys.sort.reverse[0,20]
-    return "<div class='empty' style='padding:8px;opacity:.5'>No renders yet</div>" if items.empty?
+    items = pairs.keys.sort.reverse[0,50]
+    return "<div class='empty-history'><div class='icon'>🎨</div><div>No renders yet</div></div>" if items.empty?
 
     items.map do |stem|
       p = pairs[stem]
@@ -525,6 +579,7 @@ module SuGptRender
     @tray.add_action_callback("refine") do |_, image_path|
       open_refine_dialog(image_path.to_s)
     end
+    @tray.add_action_callback("refresh_history") { |_, _| push_history }
     @tray.add_action_callback("edit_prompt")     { |_, _| edit_prompt }
     @tray.add_action_callback("set_key")         { |_, _| set_api_key; refresh_tray }
     @tray.add_action_callback("check_update")    { |_, _| check_update(true) }
@@ -594,7 +649,8 @@ module SuGptRender
   def self.push_history
     return unless @tray && @tray.visible?
     html = render_history_html
-    @tray.execute_script("setHistory(#{html.to_json})")
+    count = count_history
+    @tray.execute_script("setHistory(#{html.to_json}, #{count})")
   end
 
   # ------ async render -------------------------------------------------------

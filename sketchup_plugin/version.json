@@ -1,5 +1,5 @@
 {
-  "version": "0.2.5",
+  "version": "0.2.6",
   "rb_url": "https://raw.githubusercontent.com/hohomehk/sketchupdrawing/main/sketchup_plugin/su_gpt_render/su_gpt_render.rb",
-  "notes": "v0.2.5 — Removed text-to-image models (only image-edit models remain, 18 in total). NEW: silent hot-reload auto-update. Once on v0.2.5+, future updates download and apply via `load __FILE__` without requiring SketchUp restart. Background polls every 10 min while tray is open."
+  "notes": "v0.2.6 — Tray now has top-level [Render] [History] tabs. History tab gets bigger thumbnails (96x64), wider list (up to 50 entries), and a count badge in the tab header. Refresh button. New empty-state design with icons."
 }
