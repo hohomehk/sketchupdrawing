@@ -1,5 +1,5 @@
 {
-  "version": "0.4.0",
-  "rb_url": "https://raw.githubusercontent.com/hohomehk/sketchupdrawing/main/sketchup_plugin/su_gpt_render/su_gpt_render.rb",
-  "notes": "v0.4.0 — Cloudflare AI Gateway support (HK 直連 Gemini work-around). NEW: 5th tab『Live Stream』using streamGenerateContent SSE — token-by-token output, configurable 1/2/3s frame interval, JPEG quality knob (default 60% to keep payload <200KB). AI Watch dropdown gets a new『Gemini 2.5 Flash (direct via AI Gateway)』option that bypasses Poe entirely (free up to 1500 RPD, then $0.10/$0.40 per million in/out tokens). Both CF AI Gateway token + Gemini API key bundled in plugin (internal-only). Pure-Ruby SSE chunk parser handles partial JSON, multi-line data:, keepalive comments, finishReason STOP. Direct path verified working from HK with HTTP 200 / 1.3-1.6s latency."
+  "version": "0.4.1",
+  "rb_url": "https://github.com/hohomehk/sketchupdrawing/releases/download/v0.4.1/su_gpt_render.rb",
+  "notes": "v0.4.1 — Build-time secret injection. Source on GitHub now uses placeholders (__INJECT_CF_AIG_TOKEN__ / __INJECT_GEMINI_API_KEY__); build-rbz.sh substitutes them from env vars at release time. Public repo is credential-clean and stops triggering GitHub secret-scanning. Auto-update rb_url switched from raw main to release-asset download URL (versioned per release) — auto-update flow unchanged for installed users, just a different URL it fetches from. No feature changes vs 0.4.0."
 }

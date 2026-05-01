@@ -723,10 +723,14 @@ class TestAiGatewayConstants < Minitest::Test
       "AI Gateway URL points at gateway.ai.cloudflare.com"
     assert SuGptRender::GEMINI_AIG_URL.include?("/google-ai-studio/v1"),
       "URL includes the google-ai-studio sub-path"
-    assert SuGptRender::GEMINI_AIG_TOKEN.start_with?("cfut_"),
-      "CF AI Gateway tokens start with cfut_"
-    assert SuGptRender::GEMINI_API_KEY.start_with?("AIza"),
-      "Google API keys start with AIza"
+    # Tokens are placeholders in source (`__INJECT_*__`) and replaced at build
+    # time by build-rbz.sh. Either form is valid; tests run on dev source.
+    tok = SuGptRender::GEMINI_AIG_TOKEN
+    assert tok.start_with?("cfut_") || tok == "__INJECT_CF_AIG_TOKEN__",
+      "AIG token must be real cfut_ value or build placeholder, got #{tok.inspect}"
+    key = SuGptRender::GEMINI_API_KEY
+    assert key.start_with?("AIza") || key == "__INJECT_GEMINI_API_KEY__",
+      "Gemini key must be real AIza value or build placeholder, got #{key.inspect}"
   end
 
   def test_aig_headers_have_both_auth
@@ -1028,16 +1032,18 @@ class TestLiveStreamLifecycle < Minitest::Test
 end
 
 class TestVersionBump < Minitest::Test
-  def test_plugin_version_is_0_4_0
-    assert_equal "0.4.0", SuGptRender::PLUGIN_VERSION
+  # Single source of truth — bump when releasing.
+  EXPECTED_VERSION = "0.4.1"
+
+  def test_plugin_version_matches_expected
+    assert_equal EXPECTED_VERSION, SuGptRender::PLUGIN_VERSION
   end
 
   def test_version_json_matches
     path = File.expand_path("../sketchup_plugin/version.json", __dir__)
     data = JSON.parse(File.read(path))
-    assert_equal "0.4.0", data["version"]
-    assert data["notes"].downcase.include?("ai gateway") ||
-           data["notes"].downcase.include?("live stream"),
-      "release notes mention AI Gateway / Live Stream"
+    assert_equal EXPECTED_VERSION, data["version"]
+    refute_empty data["notes"], "release notes must not be empty"
+    assert data["rb_url"].start_with?("https://"), "rb_url is https"
   end
 end

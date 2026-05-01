@@ -14,7 +14,7 @@ require 'thread'   # Queue used by Live Stream main↔bg thread handoff
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.4.0"
+  PLUGIN_VERSION = "0.4.1"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -26,11 +26,14 @@ module SuGptRender
   # and egresses through non-HK IPs. Empirically verified from HK with HTTP
   # 200, 1.3-1.6s latency, and SSE streaming works.
   #
-  # Both tokens are bundled in-plugin: this is internal-deploy only and the
-  # accepted leak risk per the firm.
+  # Two secrets below are placeholders in source — replaced at .rbz build time
+  # by sketchup_plugin/build-rbz.sh from $CF_AIG_TOKEN / $GEMINI_API_KEY env.
+  # Source on GitHub stays clean; secrets only land in shipped .rbz / release
+  # asset .rb (which are also the URL the auto-update flow fetches).
+  # Bundled in-plugin is internal-deploy-only; accepted leak risk per the firm.
   GEMINI_AIG_URL   = "https://gateway.ai.cloudflare.com/v1/945eb571b27f72d3ad419c2468313f6f/hohome-gemini/google-ai-studio/v1"
-  GEMINI_AIG_TOKEN = "cfut_OA1G8VW9NHR7Pqn6IkTcfESgpPw42A2WqOzDVUiq5cacdaa1"
-  GEMINI_API_KEY   = "AIzaSyByYt_-VHedKn15VGWYeM1osXO2GB-WYR0"
+  GEMINI_AIG_TOKEN = "__INJECT_CF_AIG_TOKEN__"
+  GEMINI_API_KEY   = "__INJECT_GEMINI_API_KEY__"
 
   # Sentinel id used in WATCH_MODELS dropdown to mean "go through AI Gateway
   # directly to Gemini 2.5 Flash, bypass Poe". Cheaper since no Poe markup.
