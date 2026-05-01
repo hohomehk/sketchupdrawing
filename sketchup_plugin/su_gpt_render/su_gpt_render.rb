@@ -12,7 +12,7 @@ require 'openssl'
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.2.6"
+  PLUGIN_VERSION = "0.2.7"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -588,27 +588,37 @@ module SuGptRender
 
     @tray.show
 
-    # Background auto-update check on open: if a new version is published,
-    # download + hot-reload silently (UI on main thread via UI.start_timer).
-    @auto_update_thread = Thread.new do
-      sleep 2
-      begin
-        if remote_update_available?
-          UI.start_timer(0, false) { download_update_and_apply(verbose: false) rescue nil }
-        end
-      rescue
-      end
-    end
+    # Background auto-update — schedule via UI.start_timer ON MAIN THREAD.
+    # (Calling UI.start_timer FROM a background Thread is unreliable in SU;
+    # the timer block never fires. So we keep all timer scheduling on main
+    # thread, and only do the actual HTTP work inside a Thread we poll.)
+    @initial_update_timer = UI.start_timer(2.0, false) { kick_auto_update }
+    @recurring_update_timer ||= UI.start_timer(600, true) { kick_auto_update }
+  end
 
-    # Recurring auto-update check: every 10 minutes. UI.start_timer fires on
-    # the main thread, where it's safe to call download_update_and_apply.
-    @recurring_update_timer ||= UI.start_timer(600, true) do
-      Thread.new do
-        begin
-          if remote_update_available?
-            UI.start_timer(0, false) { download_update_and_apply(verbose: false) rescue nil }
-          end
-        rescue
+  # Spawn a Ruby Thread to do the (slow) HTTP version check, then poll the
+  # thread state from the main UI thread via UI.start_timer. When the thread
+  # finishes with "newer version available", trigger download_update_and_apply
+  # on the main thread (where it's safe to manipulate UI).
+  def self.kick_auto_update
+    return if @bg_thread && @bg_thread.alive?            # render in progress
+    return if @update_thread && @update_thread.alive?    # already checking
+
+    puts "[GPT Render] auto-update check..."
+    @update_thread = Thread.new do
+      Thread.current[:available] = remote_update_available? rescue false
+    end
+    @update_poll_timer = UI.start_timer(0.4, true) do
+      if @update_thread.nil? || !@update_thread.alive?
+        UI.stop_timer(@update_poll_timer) if @update_poll_timer
+        @update_poll_timer = nil
+        avail = (@update_thread && @update_thread[:available]) ? true : false
+        @update_thread = nil
+        if avail
+          puts "[GPT Render] update available, applying..."
+          download_update_and_apply(verbose: false)
+        else
+          puts "[GPT Render] up-to-date"
         end
       end
     end

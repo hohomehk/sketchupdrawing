@@ -1,5 +1,5 @@
 {
-  "version": "0.2.6",
+  "version": "0.2.7",
   "rb_url": "https://raw.githubusercontent.com/hohomehk/sketchupdrawing/main/sketchup_plugin/su_gpt_render/su_gpt_render.rb",
-  "notes": "v0.2.6 — Tray now has top-level [Render] [History] tabs. History tab gets bigger thumbnails (96x64), wider list (up to 50 entries), and a count badge in the tab header. Refresh button. New empty-state design with icons."
+  "notes": "v0.2.7 — Fix: silent auto-update did not fire on v0.2.5/0.2.6 because UI.start_timer was called from a background Thread (unreliable in SketchUp Ruby). Now we schedule all timers on the main thread and use a polling timer to check the HTTP-check thread state, then apply on main."
 }
