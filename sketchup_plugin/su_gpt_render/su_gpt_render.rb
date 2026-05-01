@@ -14,7 +14,7 @@ require 'thread'   # Queue used by Live Stream main↔bg thread handoff
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.4.3"
+  PLUGIN_VERSION = "0.4.4"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -851,6 +851,11 @@ module SuGptRender
     interval = (cfg["live_interval"] || 2).to_i.clamp(1, 30)
 
     push_live_state(true)
+    # Wipe the output area on Start (and only on Start). Per-frame replies
+    # accumulate as separate paragraphs so the user can scroll back.
+    if @tray && @tray.visible?
+      @tray.execute_script("_liveClear && _liveClear();")
+    end
     push_live_status("Live stream: ON (#{interval}s)", "ok")
 
     # Drain queue from main thread (Net::HTTP read_body is on bg thread).
@@ -1327,7 +1332,7 @@ module SuGptRender
           </div>
 
           <h3>Streamed output</h3>
-          <div id="live_output" style="background:#0a0a0a;border:1px solid #2a2a2a;border-radius:4px;padding:10px;min-height:80px;font-size:12.5px;line-height:1.5;white-space:pre-wrap;color:#cfc;"></div>
+          <div id="live_output" style="background:#0a0a0a;border:1px solid #2a2a2a;border-radius:4px;padding:10px;min-height:80px;max-height:280px;overflow-y:auto;font-size:12.5px;line-height:1.5;white-space:pre-wrap;color:#cfc;"></div>
         </div>
 
         <!-- ========== History tab ========== -->
@@ -1419,6 +1424,32 @@ module SuGptRender
             pill.className   = 'aiw-status ' + (enabled ? 'on' : 'off');
           }
         }
+        // The output area is an append-only log of model replies across frames
+        // in the current Live Stream session. Each frame's reply lands in its
+        // own paragraph prefixed with HH:MM:SS. The CURRENT (still-streaming)
+        // reply lives in the last <p data-cur="1">…</p>; older replies stay put.
+        // The Start button clears the whole log; new frames just push fresh.
+        function _liveCurrentEl() {
+          return document.querySelector('#live_output p[data-cur="1"]');
+        }
+        function _liveNewBlock() {
+          const out = document.getElementById('live_output');
+          if (!out) return null;
+          const prev = _liveCurrentEl();
+          if (prev) prev.removeAttribute('data-cur');     // freeze the previous reply
+          const ts = new Date().toTimeString().slice(0, 8);
+          const p = document.createElement('p');
+          p.setAttribute('data-cur', '1');
+          p.style.margin = '0 0 8px 0';
+          p.innerHTML = '<span style="color:#888">[' + ts + ']</span> ';
+          out.appendChild(p);
+          out.scrollTop = out.scrollHeight;
+          return p;
+        }
+        function _liveClear() {
+          const out = document.getElementById('live_output');
+          if (out) out.textContent = '';
+        }
         function setLiveFrame(url) {
           const img = document.getElementById('live_frame');
           const empty = document.getElementById('live_frame_empty');
@@ -1426,18 +1457,22 @@ module SuGptRender
             img.src = url + '?_=' + Date.now();
             img.style.display = 'block';
             if (empty) empty.style.display = 'none';
-            // New frame → start a fresh streamed-output buffer.
-            const out = document.getElementById('live_output');
-            if (out) out.textContent = '';
+            // New frame → start a fresh paragraph for the next reply,
+            // BUT keep prior replies visible so the user can re-read them.
+            _liveNewBlock();
           }
         }
         function appendLiveToken(delta, fullText) {
+          const cur = _liveCurrentEl() || _liveNewBlock();
+          if (!cur) return;
+          // Replace the text node after the timestamp span with fullText.
+          while (cur.childNodes.length > 1) cur.removeChild(cur.lastChild);
+          cur.appendChild(document.createTextNode(fullText));
           const out = document.getElementById('live_output');
-          if (out) out.textContent = fullText;
+          if (out) out.scrollTop = out.scrollHeight;
         }
         function liveDone(fullText, todayCount, todayCost) {
-          const out = document.getElementById('live_output');
-          if (out) out.textContent = fullText;
+          appendLiveToken('', fullText);
           const t = document.getElementById('live_today');
           if (t) t.textContent = todayCount + ' streams · ~$' + todayCost;
         }

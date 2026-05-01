@@ -1,5 +1,5 @@
 {
-  "version": "0.4.3",
-  "rb_url": "https://github.com/hohomehk/sketchupdrawing/releases/download/v0.4.3/su_gpt_render.rb",
-  "notes": "v0.4.3 — fix empty Live Stream output + drop bundled Gemini key. Three changes: (1) URL path /v1 → /v1beta so generationConfig.thinkingConfig is accepted by Gemini API. (2) Set thinkingConfig.thinkingBudget=0 for flash models — earlier versions silently spent all maxOutputTokens on internal 'thoughts' and emitted zero candidate text, hence the empty streamed output users hit on 0.4.0–0.4.2. (3) BYOK: Gemini API key now stored in CF AI Gateway settings server-side; plugin only ships the cf-aig-authorization token. Fixes Google's automatic leaked-key revocation that broke the field a few hours after 0.4.0/0.4.1 shipped. gemini-3.1-pro-preview added as a watch+stream option (thinking on by design)."
+  "version": "0.4.4",
+  "rb_url": "https://github.com/hohomehk/sketchupdrawing/releases/download/v0.4.4/su_gpt_render.rb",
+  "notes": "v0.4.4 — Live Stream output now persists across frames. setLiveFrame was wiping live_output every tick (~every 2s), so the streamed text appeared and immediately disappeared. Now each frame's reply lands in its own timestamped paragraph; older replies stay visible. Output area is scrollable (max-height 280px). Start Live still clears the log."
 }
