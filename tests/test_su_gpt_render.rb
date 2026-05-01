@@ -381,6 +381,114 @@ end
 
 # ============================================================================
 
+class TestPromptTemplates < Minitest::Test
+  def setup
+    File.delete(TEST_CFG_PATH) if File.exist?(TEST_CFG_PATH)
+  end
+
+  def test_builtin_templates_present
+    tpls = SuGptRender.all_templates
+    assert tpls.length >= 7, "at least 7 builtins, got #{tpls.length}"
+    builtin_names = tpls.select { |t| t["source"] == "builtin" }.map { |t| t["name"] }
+    assert builtin_names.any? { |n| n.include?("HK Residential") }, "has HK Residential template"
+    assert builtin_names.any? { |n| n.include?("Walnut") }, "has walnut template"
+    assert builtin_names.any? { |n| n.include?("Marble") }, "has marble template"
+  end
+
+  def test_save_user_template
+    SuGptRender.save_user_template("My HK style", "preserve geom; oak; warm")
+    tpls = SuGptRender.all_templates
+    user = tpls.select { |t| t["source"] == "user" }
+    assert_equal 1, user.length
+    assert_equal "My HK style", user.first["name"]
+    assert_equal "preserve geom; oak; warm", user.first["prompt"]
+  end
+
+  def test_replace_existing_user_template
+    SuGptRender.save_user_template("dup", "v1")
+    SuGptRender.save_user_template("dup", "v2")
+    user = SuGptRender.all_templates.select { |t| t["source"] == "user" }
+    assert_equal 1, user.length
+    assert_equal "v2", user.first["prompt"]
+  end
+
+  def test_delete_user_template
+    SuGptRender.save_user_template("toDel", "x")
+    user = SuGptRender.all_templates.select { |t| t["source"] == "user" }
+    refute user.empty?
+    id = user.first["id"]
+    SuGptRender.delete_user_template(id)
+    user = SuGptRender.all_templates.select { |t| t["source"] == "user" }
+    assert user.empty?
+  end
+
+  def test_find_template_by_id
+    tpl = SuGptRender.find_template("b0")
+    assert tpl, "first builtin (b0) findable"
+    assert_equal "builtin", tpl["source"]
+  end
+
+  def test_set_active_prompt
+    SuGptRender.set_active_prompt("hello")
+    assert_equal "hello", SuGptRender.load_config["prompt"]
+  end
+
+  def test_render_templates_html_no_error
+    html = SuGptRender.render_templates_html
+    assert_kind_of String, html
+    assert html.include?("HK Residential")
+  end
+end
+
+class TestPromptHistory < Minitest::Test
+  def setup
+    @tmp_dir = Dir.mktmpdir("test_prompt_history")
+    @model = Sketchup.active_model
+    @model.path = File.join(@tmp_dir, "test.skp")
+    File.binwrite(@model.path, "fake")
+    FileUtils.mkdir_p(File.join(@tmp_dir, "gpt_render"))
+  end
+
+  def teardown
+    FileUtils.remove_entry(@tmp_dir) if @tmp_dir
+    Sketchup.reset_model!
+  end
+
+  def make_meta(stem, prompt, model: "GPT-Image-2", finished: "2026-05-01T12:00:00Z")
+    File.write(File.join(@tmp_dir, "gpt_render", "#{stem}_meta.json"),
+      JSON.generate({
+        "prompt" => prompt, "model" => model,
+        "finished_at" => finished,
+      }))
+  end
+
+  def test_recent_prompts_dedup
+    make_meta("20260501_120000_a", "prompt one")
+    make_meta("20260501_130000_b", "prompt one")  # duplicate
+    make_meta("20260501_140000_c", "prompt two")
+    items = SuGptRender.recent_prompts
+    assert_equal 2, items.length, "deduped"
+  end
+
+  def test_recent_prompts_limit_15
+    20.times { |i| make_meta(sprintf("20260501_%06d_x", i), "prompt #{i}") }
+    items = SuGptRender.recent_prompts
+    assert_equal 15, items.length
+  end
+
+  def test_recent_prompts_html_empty
+    html = SuGptRender.render_recent_prompts_html
+    assert html.include?("No past prompts yet")
+  end
+
+  def test_recent_prompts_html_with_entries
+    make_meta("20260501_120000_a", "test prompt content here")
+    html = SuGptRender.render_recent_prompts_html
+    assert html.include?("test prompt content here")
+    assert html.include?("GPT-Image-2")
+  end
+end
+
 class TestImageModelList < Minitest::Test
   def test_no_t2i_models
     SuGptRender::IMAGE_MODELS.each do |entry|

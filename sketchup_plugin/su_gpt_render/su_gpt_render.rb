@@ -9,10 +9,11 @@ require 'uri'
 require 'base64'
 require 'cgi'
 require 'openssl'
+require 'time'
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.2.7"
+  PLUGIN_VERSION = "0.2.8"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -58,6 +59,108 @@ module SuGptRender
 
     Output aspect ratio 3:2, high quality.
   PROMPT
+
+  # Built-in prompt templates. User can also save their own (stored in config).
+  BUILTIN_TEMPLATES = [
+    {
+      "name" => "HK Residential — Light Oak (default)",
+      "prompt" => DEFAULT_PROMPT,
+    },
+    {
+      "name" => "Walnut Luxury — Hotel Suite",
+      "prompt" => <<~P.strip,
+        Transform this 3D architectural rendering into a photorealistic interior photograph
+        of a luxury 5-star hotel suite.
+
+        CRITICAL: Preserve the exact cabinet shape, position, dimensions, shelving layout,
+        and overall geometry — do NOT change the structure or proportions.
+
+        Add: rich dark walnut wood grain texture with visible figure, beige/champagne textured walls,
+        dark hardwood herringbone floor, warm golden hour lighting from soft directional source,
+        cinematic ambient occlusion, slight film grain. Modern luxury minimalist aesthetic.
+        Do NOT add furniture, decor, plants, or human figures.
+
+        Output aspect ratio 3:2, high quality.
+      P
+    },
+    {
+      "name" => "Marble Bathroom — Soft White",
+      "prompt" => <<~P.strip,
+        Transform this 3D architectural rendering into a photorealistic interior photograph
+        of a clean modern bathroom.
+
+        CRITICAL: Preserve all cabinet/vanity shapes, dimensions, layout — do NOT change the structure.
+
+        Add: white Carrara marble with grey veining for vanity tops and walls, brushed nickel fixtures,
+        soft white wall paint, light grey large-format porcelain floor, gentle daylight from window,
+        subtle reflective surfaces, fresh and bright atmosphere. Modern hotel bathroom style.
+        Do NOT add furniture, decor, plants, or human figures.
+
+        Output aspect ratio 3:2, high quality.
+      P
+    },
+    {
+      "name" => "Nordic Minimal — Cool Grey",
+      "prompt" => <<~P.strip,
+        Transform this 3D architectural rendering into a photorealistic Scandinavian-style interior.
+
+        CRITICAL: Preserve the exact cabinet shape, dimensions, layout — do NOT change the structure.
+
+        Add: light Nordic ash wood with subtle grain on cabinets, cool light grey walls,
+        light grey concrete-look floor, diffuse cool natural daylight, soft shadow falloff,
+        clean minimal Scandinavian aesthetic. Hygge atmosphere with calm restrained palette.
+        Do NOT add furniture, decor, plants, or human figures.
+
+        Output aspect ratio 3:2, high quality.
+      P
+    },
+    {
+      "name" => "Cabinet Shop — Technical Accurate",
+      "prompt" => <<~P.strip,
+        Render this 3D model as a technical product photograph for a cabinet shop drawing.
+
+        CRITICAL: Preserve EVERY cabinet shape, dimension, shelving line, panel proportion,
+        and detail line EXACTLY. Do NOT add or remove any structural element. Do NOT smooth
+        away technical detail. The output must be dimensionally accurate.
+
+        Style: studio softbox lighting, even illumination, neutral white background,
+        light maple wood texture, clean factory-photo aesthetic. No environment or context.
+        Do NOT add walls, floor, ceiling, or any room context — just the cabinet on a soft white sweep.
+
+        Output aspect ratio 3:2, high quality.
+      P
+    },
+    {
+      "name" => "Showroom — Retail Display",
+      "prompt" => <<~P.strip,
+        Transform this 3D rendering into a photoreal retail showroom display photograph.
+
+        CRITICAL: Preserve cabinet structure, shelving, dimensions exactly.
+
+        Add: polished concrete floor with subtle reflection, dark grey gallery walls,
+        directional spotlights highlighting the cabinet, dramatic but clean lighting,
+        product-photography aesthetic, professional editorial finish.
+        Do NOT add furniture, decor, plants, or human figures.
+
+        Output aspect ratio 3:2, high quality.
+      P
+    },
+    {
+      "name" => "Office — Modern Workspace",
+      "prompt" => <<~P.strip,
+        Transform this 3D rendering into a photorealistic modern office interior photograph.
+
+        CRITICAL: Preserve all cabinet/storage geometry exactly.
+
+        Add: light walnut veneer cabinetry, smooth white acoustic ceiling, light grey carpet
+        tiles, subtle daylight from large windows, minimal blue accent on signage details,
+        clean corporate aesthetic. Architectural photography style.
+        Do NOT add desks, chairs, computers, plants, or human figures.
+
+        Output aspect ratio 3:2, high quality.
+      P
+    },
+  ]
 
   # ------ config -------------------------------------------------------------
   def self.load_config
@@ -290,6 +393,21 @@ module SuGptRender
         #history_pane .history .meta .sub { font-size:11px; }
         #history_pane .empty-history { padding:40px 20px; text-align:center; opacity:.5; }
         #history_pane .empty-history .icon { font-size:32px; margin-bottom:10px; }
+        /* Prompts tab */
+        #prompts_pane .empty-history { padding:24px 20px; text-align:center; opacity:.5; }
+        #prompts_pane .empty-history .icon { font-size:24px; margin-bottom:8px; }
+        .tpl-item { display:flex; gap:8px; padding:8px; align-items:flex-start; border:1px solid #2a2a2a; border-radius:5px; margin-bottom:6px; background:#222; }
+        .tpl-item:hover { border-color:#3a3a3a; }
+        .tpl-item .tpl-meta { flex:1; min-width:0; }
+        .tpl-item .tpl-name { font-size:12px; font-weight:600; color:#ddd; margin-bottom:3px; }
+        .tpl-item .tpl-preview { font-size:11px; opacity:.55; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .tpl-item button.small { padding:4px 8px; font-size:11px; flex-shrink:0; }
+        .tpl-item button.danger { background:#3a1a1a; border-color:#5a2a2a; color:#fcc; }
+        .tpl-item .tag { display:inline-block; font-size:9px; padding:1px 5px; border-radius:3px; margin-right:5px; vertical-align:middle; text-transform:uppercase; letter-spacing:.5px; }
+        .tpl-item .tag.builtin { background:#264; color:#cfb; }
+        .tpl-item .tag.user { background:#246; color:#cdf; }
+        .tpl-item .tag.tweak { background:#642; color:#fcb; }
+        .tpl-item .dim { opacity:.55; font-size:10px; font-weight:400; margin-right:4px; }
         .small-btns { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px; }
         .info-grid { display:grid; grid-template-columns: auto 1fr; gap:4px 12px; padding:8px 10px; background:#222; border-radius:4px; font-size:11px; margin-bottom:10px; }
         .info-grid div:nth-child(odd) { opacity:.6; }
@@ -317,6 +435,7 @@ module SuGptRender
 
         <div class="maintabs">
           <button id="mt_render"  class="active" onclick="switchMainTab('render')">Render</button>
+          <button id="mt_prompts" onclick="switchMainTab('prompts')">Prompts</button>
           <button id="mt_history" onclick="switchMainTab('history')">History <span class="badge" id="hist_count">#{history_count}</span></button>
         </div>
 
@@ -366,6 +485,17 @@ module SuGptRender
             <button class="small" onclick="refineCurrent()" title="用呢張結果做 input 再 render，加 tweak 指示">↻ Refine this</button>
             <button class="small" onclick="openCurrentImage()">Open full size</button>
           </div>
+        </div>
+
+        <!-- ========== Prompts tab ========== -->
+        <div id="prompts_pane" class="pane">
+          <div class="small-btns">
+            <button class="small" onclick="cmd('edit_prompt')">Edit Active Prompt</button>
+          </div>
+          <h3 style="margin-top:8px">Templates</h3>
+          <div id="templates_list">#{render_templates_html}</div>
+          <h3>Recent prompts (from your past renders)</h3>
+          <div id="recent_prompts">#{render_recent_prompts_html}</div>
         </div>
 
         <!-- ========== History tab ========== -->
@@ -435,10 +565,22 @@ module SuGptRender
           }
         }
         function switchMainTab(name) {
-          document.getElementById('mt_render').classList.toggle('active', name === 'render');
-          document.getElementById('mt_history').classList.toggle('active', name === 'history');
-          document.getElementById('render_pane').classList.toggle('active', name === 'render');
-          document.getElementById('history_pane').classList.toggle('active', name === 'history');
+          ['render','prompts','history'].forEach(n => {
+            const tabBtn = document.getElementById('mt_' + n);
+            const pane = document.getElementById(n + '_pane');
+            if (tabBtn) tabBtn.classList.toggle('active', name === n);
+            if (pane) pane.classList.toggle('active', name === n);
+          });
+        }
+        function useTpl(id) { sketchup.use_template(id); }
+        function deleteTpl(id) {
+          if (confirm('Delete this template?')) sketchup.delete_template(id);
+        }
+        function useRecent(i) { sketchup.use_recent_prompt(String(i)); }
+        function saveRecentAsTpl(i) { sketchup.save_recent_as_template(String(i)); }
+        function setPromptsHTML(tplHtml, recentHtml) {
+          document.getElementById('templates_list').innerHTML = tplHtml;
+          document.getElementById('recent_prompts').innerHTML = recentHtml;
         }
         function doRender() {
           const opts = {
@@ -471,6 +613,120 @@ module SuGptRender
     model = Sketchup.active_model
     return nil if model.nil? || model.path.empty?
     File.join(File.dirname(model.path), "gpt_render")
+  end
+
+  # ----- HTML render helpers for the Prompts tab -----------------------------
+  def self.render_templates_html
+    items = all_templates
+    items.map { |t|
+      tag = t["source"] == "builtin" ? "<span class='tag builtin'>built-in</span>" : "<span class='tag user'>my</span>"
+      preview = CGI.escapeHTML(t["prompt"][0,90]).gsub("\n", " ")
+      del_btn = t["source"] == "user" ? "<button class='small danger' onclick=\"deleteTpl(#{t['id'].to_json})\" title='Delete'>×</button>" : ""
+      <<~HTML
+        <div class="tpl-item">
+          <div class="tpl-meta">
+            <div class="tpl-name">#{tag} #{CGI.escapeHTML(t['name'])}</div>
+            <div class="tpl-preview">#{preview}…</div>
+          </div>
+          <button class='small' onclick="useTpl(#{t['id'].to_json})">Use</button>
+          #{del_btn}
+        </div>
+      HTML
+    }.join("\n")
+  end
+
+  def self.render_recent_prompts_html
+    items = recent_prompts
+    return "<div class='empty-history'><div class='icon'>💬</div><div>No past prompts yet</div><div style='font-size:11px;margin-top:6px'>Render once and your prompts will appear here</div></div>" if items.empty?
+    items.each_with_index.map { |r, i|
+      preview = CGI.escapeHTML(r["prompt"][0,140]).gsub("\n", " ")
+      tweak = r["tweak"].to_s.empty? ? "" : "<span class='tag tweak'>refined</span>"
+      ts = r["used_at"].to_s
+      time_label = ts.length >= 16 ? ts[5,11].sub("T", " ") : ts
+      <<~HTML
+        <div class="tpl-item">
+          <div class="tpl-meta">
+            <div class="tpl-name">#{tweak} <span class='dim'>#{CGI.escapeHTML(r['model'].to_s)}</span> <span class='dim'>#{time_label}</span></div>
+            <div class="tpl-preview">#{preview}…</div>
+          </div>
+          <button class='small' onclick="useRecent(#{i})">Use</button>
+          <button class='small' onclick="saveRecentAsTpl(#{i})" title='Save as template'>+</button>
+        </div>
+      HTML
+    }.join("\n")
+  end
+
+  # ----- prompt templates ----------------------------------------------------
+
+  # Returns array of {name, prompt, source: "builtin"|"user", id, created_at?}
+  def self.all_templates
+    cfg = load_config
+    user_tpl = (cfg["templates"] || []).map.with_index { |t, i|
+      t.merge("source" => "user", "id" => "u#{i}")
+    }
+    builtin = BUILTIN_TEMPLATES.map.with_index { |t, i|
+      t.merge("source" => "builtin", "id" => "b#{i}")
+    }
+    builtin + user_tpl
+  end
+
+  def self.find_template(id)
+    all_templates.find { |t| t["id"].to_s == id.to_s }
+  end
+
+  def self.save_user_template(name, prompt)
+    cfg = load_config
+    cfg["templates"] ||= []
+    # Replace if name exists, else append
+    existing = cfg["templates"].find { |t| t["name"] == name }
+    if existing
+      existing["prompt"] = prompt
+      existing["updated_at"] = Time.now.iso8601
+    else
+      cfg["templates"] << {
+        "name" => name,
+        "prompt" => prompt,
+        "created_at" => Time.now.iso8601,
+      }
+    end
+    save_config(cfg)
+  end
+
+  def self.delete_user_template(id)
+    cfg = load_config
+    return false unless cfg["templates"]
+    idx = id.to_s.sub(/^u/, "").to_i
+    return false if idx < 0 || idx >= cfg["templates"].length
+    cfg["templates"].delete_at(idx)
+    save_config(cfg)
+    true
+  end
+
+  def self.set_active_prompt(prompt)
+    cfg = load_config
+    cfg["prompt"] = prompt
+    save_config(cfg)
+  end
+
+  # ----- prompt history (derived from past _meta.json) -----------------------
+
+  def self.recent_prompts
+    dir = history_dir
+    return [] unless dir && File.directory?(dir)
+    seen = {}   # prompt → first occurrence info
+    Dir.glob(File.join(dir, "*_meta.json")).sort.reverse.each do |meta|
+      data = JSON.parse(File.read(meta)) rescue nil
+      next unless data && data["prompt"]
+      prompt = data["prompt"]
+      next if seen[prompt]   # de-dup
+      seen[prompt] = {
+        "prompt" => prompt,
+        "model"  => data["model"],
+        "used_at" => data["finished_at"] || data["started_at"],
+        "tweak"   => data["tweak"],
+      }
+    end
+    seen.values.first(15)
   end
 
   def self.count_history
@@ -580,6 +836,40 @@ module SuGptRender
       open_refine_dialog(image_path.to_s)
     end
     @tray.add_action_callback("refresh_history") { |_, _| push_history }
+    @tray.add_action_callback("use_template") do |_, id|
+      tpl = find_template(id)
+      if tpl
+        set_active_prompt(tpl["prompt"])
+        push_status("Loaded template: #{tpl['name']}", "ok")
+        refresh_tray
+      end
+    end
+    @tray.add_action_callback("delete_template") do |_, id|
+      delete_user_template(id)
+      push_prompts
+      push_status("Template deleted.", "ok")
+    end
+    @tray.add_action_callback("use_recent_prompt") do |_, idx|
+      r = recent_prompts[idx.to_i]
+      if r
+        set_active_prompt(r["prompt"])
+        push_status("Loaded recent prompt", "ok")
+        refresh_tray
+      end
+    end
+    @tray.add_action_callback("save_recent_as_template") do |_, idx|
+      r = recent_prompts[idx.to_i]
+      next unless r
+      input = UI.inputbox(["Template name"],
+        ["#{r['model']} #{r['used_at'].to_s[0,10]}"],
+        "Save as template")
+      next unless input
+      name = input.first.to_s.strip
+      next if name.empty?
+      save_user_template(name, r["prompt"])
+      push_prompts
+      push_status("Saved template: #{name}", "ok")
+    end
     @tray.add_action_callback("edit_prompt")     { |_, _| edit_prompt }
     @tray.add_action_callback("set_key")         { |_, _| set_api_key; refresh_tray }
     @tray.add_action_callback("check_update")    { |_, _| check_update(true) }
@@ -661,6 +951,11 @@ module SuGptRender
     html = render_history_html
     count = count_history
     @tray.execute_script("setHistory(#{html.to_json}, #{count})")
+  end
+
+  def self.push_prompts
+    return unless @tray && @tray.visible?
+    @tray.execute_script("setPromptsHTML(#{render_templates_html.to_json}, #{render_recent_prompts_html.to_json})")
   end
 
   # ------ async render -------------------------------------------------------
@@ -911,6 +1206,7 @@ module SuGptRender
       <textarea id="prompt">#{cur_html}</textarea>
       <div class="row">
         <button class="primary" onclick="window.location='skp:save@'+encodeURIComponent(document.getElementById('prompt').value)">Save</button>
+        <button onclick="window.location='skp:save_template@'+encodeURIComponent(document.getElementById('prompt').value)" title='Save current text as a named template'>Save as template…</button>
         <button onclick="window.location='skp:cancel@'">Cancel</button>
         <div class="spacer"></div>
         <button class="danger" onclick="if(confirm('Reset to default?')){document.getElementById('prompt').value='#{default_html}';}">Reset to default</button>
@@ -924,6 +1220,16 @@ module SuGptRender
       dlg.close
       refresh_tray
       UI.messagebox("Prompt saved (#{decoded.length} chars).")
+    end
+    dlg.add_action_callback("save_template") do |_, value|
+      decoded = CGI.unescape(value.to_s)
+      input = UI.inputbox(["Template name"], ["My template"], "Save as template")
+      next unless input
+      name = input.first.to_s.strip
+      next if name.empty?
+      save_user_template(name, decoded)
+      push_prompts
+      UI.messagebox("Saved template: #{name}")
     end
     dlg.add_action_callback("cancel") { |_, _| dlg.close }
     dlg.show

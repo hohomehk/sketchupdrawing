@@ -1,5 +1,5 @@
 {
-  "version": "0.2.7",
+  "version": "0.2.8",
   "rb_url": "https://raw.githubusercontent.com/hohomehk/sketchupdrawing/main/sketchup_plugin/su_gpt_render/su_gpt_render.rb",
-  "notes": "v0.2.7 — Fix: silent auto-update did not fire on v0.2.5/0.2.6 because UI.start_timer was called from a background Thread (unreliable in SketchUp Ruby). Now we schedule all timers on the main thread and use a polling timer to check the HTTP-check thread state, then apply on main."
+  "notes": "v0.2.8 — New 'Prompts' tab in tray with built-in templates (HK Residential, Walnut Luxury, Marble Bathroom, Nordic Minimal, Cabinet Shop, Showroom, Office) + your past prompts (deduped, 15 most recent). Save current prompt as named template; one-click load any template/recent into active prompt."
 }
