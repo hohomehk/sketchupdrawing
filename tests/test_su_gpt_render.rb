@@ -1064,7 +1064,7 @@ end
 
 class TestVersionBump < Minitest::Test
   # Single source of truth — bump when releasing.
-  EXPECTED_VERSION = "0.6.1"
+  EXPECTED_VERSION = "0.6.3"
 
   def test_plugin_version_matches_expected
     assert_equal EXPECTED_VERSION, SuGptRender::PLUGIN_VERSION
@@ -1495,5 +1495,199 @@ class TestLiveRenderTabUi < Minitest::Test
   def test_default_live_render_prompt_constant
     assert SuGptRender::DEFAULT_LIVE_RENDER_PROMPT.length > 50
     assert SuGptRender::DEFAULT_LIVE_RENDER_PROMPT.downcase.include?("photorealistic")
+  end
+end
+
+# ============================================================================
+# v0.6.2 — Boost material contrast: temporary segmentation-palette repaint
+# of each scoped material before the Shaded view is captured, restored on
+# exit (even on raise) via start_operation(transparent:true) +
+# abort_operation. Plus the material table grows an "Original HEX" column
+# when boost is on.
+# ============================================================================
+
+class TestSegmentationPalette < Minitest::Test
+  # Tiny material stub: just stores a Sketchup::Color and lets us check
+  # the colour after the helper runs.
+  class MaterialStub
+    attr_accessor :color, :name
+    def initialize(name, r, g, b)
+      @name  = name
+      @color = Sketchup::Color.new(r, g, b)
+    end
+    def display_name; @name; end
+  end
+
+  def setup
+    Sketchup.reset_model!
+    @model = Sketchup.active_model
+  end
+
+  def palette; SuGptRender::SEGMENTATION_PALETTE; end
+
+  def hex_of(color)
+    format("#%02X%02X%02X", color.red, color.green, color.blue)
+  end
+
+  def test_palette_size_and_no_magenta
+    assert_equal 12, palette.length, "palette must be 12 entries"
+    refute_includes palette.map(&:upcase), "#FF00FF",
+      "pure magenta is the window marker — must not be in the segmentation palette"
+    palette.each do |hex|
+      assert_match(/\A#[0-9A-Fa-f]{6}\z/, hex, "palette entry not 6-hex: #{hex}")
+    end
+    assert_equal palette.uniq.length, palette.length, "palette entries must be distinct"
+  end
+
+  def test_boost_off_preserves_material_colors
+    # Hand-crafted "real" material colours like a typical HK SU file.
+    mats = [
+      MaterialStub.new("White wall",   0xF0, 0xF0, 0xE8),
+      MaterialStub.new("Cream cabinet",0xE8, 0xDC, 0xC0),
+      MaterialStub.new("Light oak",    0xB8, 0xA5, 0x82),
+    ]
+    originals = mats.map { |m| m.color.dup }
+    inside_colors = nil
+
+    SuGptRender.with_segmentation_palette(@model, mats) do
+      inside_colors = mats.map { |m| hex_of(m.color) }
+    end
+
+    # Inside the block, colours were re-painted to the palette in order.
+    assert_equal palette[0], inside_colors[0]
+    assert_equal palette[1], inside_colors[1]
+    assert_equal palette[2], inside_colors[2]
+
+    # After the block, originals are restored.
+    mats.each_with_index do |m, i|
+      assert_equal originals[i].red,   m.color.red,   "#{m.name}: red restored"
+      assert_equal originals[i].green, m.color.green, "#{m.name}: green restored"
+      assert_equal originals[i].blue,  m.color.blue,  "#{m.name}: blue restored"
+    end
+
+    # And the start/abort_operation pair was actually used (silent edit).
+    assert_equal 1, @model.start_operation_calls, "start_operation called once"
+    assert_equal 1, @model.abort_operation_calls, "abort_operation called once"
+  end
+
+  def test_boost_off_preserves_on_raise
+    mats = [
+      MaterialStub.new("Wall",     0xF0, 0xF0, 0xE8),
+      MaterialStub.new("Cabinet",  0xE8, 0xDC, 0xC0),
+    ]
+    originals = mats.map { |m| m.color.dup }
+
+    err = assert_raises(RuntimeError) do
+      SuGptRender.with_segmentation_palette(@model, mats) do
+        # Sanity: we DID enter the recoloured state before the raise.
+        assert_equal palette[0], hex_of(mats[0].color)
+        raise "simulated capture failure"
+      end
+    end
+    assert_equal "simulated capture failure", err.message
+
+    # Even with the raise, abort_operation ran (in the ensure block) and
+    # the manual restore-fallback put the original colours back. The
+    # .skp's material colours must NOT be persisted to the synthetic
+    # palette after the call returns.
+    mats.each_with_index do |m, i|
+      assert_equal originals[i].red,   m.color.red,   "#{m.name}: red restored on raise"
+      assert_equal originals[i].green, m.color.green, "#{m.name}: green restored on raise"
+      assert_equal originals[i].blue,  m.color.blue,  "#{m.name}: blue restored on raise"
+    end
+    assert_equal 1, @model.abort_operation_calls,
+      "abort_operation must run from the ensure block even on raise"
+  end
+
+  def test_palette_wraps_for_extra_materials
+    # 13 materials → 13th must wrap back to palette[0].
+    mats = Array.new(13) { |i| MaterialStub.new("m#{i}", 100, 100, 100) }
+    inside = nil
+    SuGptRender.with_segmentation_palette(@model, mats) do
+      inside = mats.map { |m| hex_of(m.color) }
+    end
+    assert_equal 13, inside.length
+    assert_equal palette[0],  inside[0]
+    assert_equal palette[11], inside[11]
+    assert_equal palette[0],  inside[12], "13th material wraps back to palette[0]"
+  end
+
+  def test_synthetic_hex_in_material_table
+    # collect_model_material_table walks model entities; we don't exercise
+    # the entity tree here — we monkey-patch collect_used_materials for
+    # this test only. The cross-cutting concern under test is: when
+    # boost_on:true, the rendered table puts SYNTHETIC palette colours in
+    # the HEX column and adds an "Original HEX" column with the real
+    # material colour.
+    real_mats = [
+      MaterialStub.new("White wall",    0xF0, 0xF0, 0xE8),
+      MaterialStub.new("Cream cabinet", 0xE8, 0xDC, 0xC0),
+      MaterialStub.new("Light oak",     0xB8, 0xA5, 0x82),
+    ]
+    SuGptRender.singleton_class.send(:alias_method, :__orig_collect_used_materials, :collect_used_materials)
+    SuGptRender.define_singleton_method(:collect_used_materials) { |_m| real_mats }
+    begin
+      table = SuGptRender.collect_model_material_table(@model, boost_on: true)
+
+      # Header row gains the 5th column.
+      assert_match(/\| HEX \| Material name \| Hint \| Texture ref \| Original HEX \|/, table)
+
+      # Each row's HEX column must be a palette entry (not the real colour).
+      data_rows = table.lines.drop(2).reject { |l| l.strip.empty? }
+      assert_equal real_mats.length, data_rows.length, "one data row per material"
+      data_rows.each_with_index do |row, i|
+        # First backticked value = HEX column = synthetic palette colour.
+        first_hex = row[/`(#[0-9A-Fa-f]{6})`/, 1]
+        assert palette.map(&:upcase).include?(first_hex.upcase),
+          "row #{i} HEX (#{first_hex.inspect}) must be from SEGMENTATION_PALETTE"
+        assert_equal palette[i % palette.length].upcase, first_hex.upcase,
+          "row #{i} HEX must be palette[#{i % palette.length}] in collect order"
+
+        # Last backticked value = Original HEX column = real material colour.
+        all_hex = row.scan(/`(#[0-9A-Fa-f]{6})`/).flatten
+        assert_equal 2, all_hex.length, "row #{i} should have 2 HEX values (synthetic + original)"
+        original_hex = all_hex.last
+        c = real_mats[i].color
+        expected = format("#%02X%02X%02X", c.red, c.green, c.blue)
+        assert_equal expected.upcase, original_hex.upcase,
+          "row #{i} Original HEX must be the real material colour"
+      end
+
+      # And the boost-off table is unchanged (4 columns, real HEX only).
+      table_off = SuGptRender.collect_model_material_table(@model, boost_on: false)
+      refute_match(/Original HEX/, table_off, "boost-off table must NOT grow the column")
+      assert_match(/\| HEX \| Material name \| Hint \| Texture ref \|/, table_off)
+    ensure
+      SuGptRender.singleton_class.send(:alias_method, :collect_used_materials, :__orig_collect_used_materials)
+      SuGptRender.singleton_class.send(:remove_method, :__orig_collect_used_materials) rescue nil
+    end
+  end
+
+  def test_preamble_explains_synthetic_palette_when_boost_on
+    table = "| HEX | Material name | Hint | Texture ref | Original HEX |\n" \
+            "|---|---|---|---|---|\n" \
+            "| `#FF0000` | Walnut | tex: oak.jpg | — | `#8B4513` |"
+    pre = SuGptRender.build_multi_view_preamble(2, "render this", table)
+    # Must call out the synthetic-palette nature so the model doesn't paint
+    # the palette colours into the output.
+    assert_match(/SYNTHETIC/, pre, "preamble must explain synthetic palette")
+    assert_match(/Original HEX/, pre, "preamble must reference the Original HEX column")
+    assert_match(/render this/, pre, "user prompt still present")
+
+    # And the boost-off path still works (no synthetic-language leakage).
+    table_off = "| HEX | Material name | Hint | Texture ref |\n" \
+                "|---|---|---|---|\n" \
+                "| `#8B4513` | Walnut | tex: oak.jpg | — |"
+    pre_off = SuGptRender.build_multi_view_preamble(2, "render this", table_off)
+    refute_match(/SYNTHETIC/, pre_off,
+      "boost-off preamble must NOT mention synthetic palette")
+  end
+
+  def test_boost_dropdown_present_in_tray
+    html = SuGptRender.tray_html
+    assert_match(/liver_boost/, html, "boost dropdown id present")
+    assert_match(/Boost material contrast/, html, "boost dropdown label visible")
+    assert_match(/setLiveRenderBoost/, html, "boost JS handler wired")
+    assert_match(/set_live_render_boost_contrast/, html, "boost action callback wired")
   end
 end

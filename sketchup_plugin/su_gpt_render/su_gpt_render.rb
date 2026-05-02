@@ -14,7 +14,7 @@ require 'thread'   # Queue used by Live Stream main↔bg thread handoff
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.6.1"
+  PLUGIN_VERSION = "0.6.3"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -1216,7 +1216,7 @@ module SuGptRender
   # JPEG) because gemini-2.5-flash-image happily accepts both and PNG keeps
   # SketchUp lines crisp (the ~3MB cost of an extra-quality input is fine
   # given the model latency dominates).
-  def self.export_view_for_live_render(width, height, multi_view: false)
+  def self.export_view_for_live_render(width, height, multi_view: false, boost_contrast: false)
     model = Sketchup.active_model
     raise "No model" unless model
     base = model.path.empty? ? "Untitled" : File.basename(model.path, ".skp")
@@ -1237,14 +1237,22 @@ module SuGptRender
                                            transparent: false)
         raise "write_image #{suffix} failed" unless ok
       }
+      # Magenta marker background ONLY for shaded captures (Image 2). Hidden
+      # Line in SU paints faces with the default white face-front, so the
+      # background only shows through window/door OPENINGS — that's where
+      # we want magenta. But Hidden Line's edges-on-bg drawing means a
+      # magenta bg paints the entire viewport magenta wherever there's
+      # nothing to occlude (interior shots → all magenta). Skip the marker
+      # for Hidden Line; clean default white bg is the right input for the
+      # AI's geometry signal.
       with_face_style(model, style) do
-        with_marker_background(model) do
+        if style == "hidden_line"
           with_flat_lighting(model) do
-            if style == "hidden_line"
-              with_clean_edges(model, &do_write)
-            else
-              do_write.call
-            end
+            with_clean_edges(model, &do_write)
+          end
+        else
+          with_marker_background(model) do
+            with_flat_lighting(model, &do_write)
           end
         end
       end
@@ -1260,13 +1268,26 @@ module SuGptRender
       #            separately-uploaded texture swatches; bundling textures
       #            into View 2 confuses the diffusion model because the
       #            texture noise muddies the colour-to-material mapping.
-      [
-        write_one.("geom",   "hidden_line"),
-        write_one.("colour", "shaded"),
-      ]
+      #
+      # v0.6.2 — when boost_contrast is on, only Image 2 (Shaded) gets
+      # the synthetic-palette treatment. Hidden Line shows pure edges, no
+      # fills, so recolouring there would be wasted work and risk extra
+      # undo-stack churn.
+      geom_path = write_one.("geom", "hidden_line")
+      colour_path =
+        if boost_contrast
+          mats = collect_used_materials(model)
+          with_segmentation_palette(model, mats) do
+            write_one.("colour", "shaded")
+          end
+        else
+          write_one.("colour", "shaded")
+        end
+      [geom_path, colour_path]
     else
       # Single-view: keep the textured shaded for backward compat (shows
-      # what a designer eyeballs).
+      # what a designer eyeballs). Boost contrast intentionally has no
+      # effect here — single-view skips the material table cross-reference.
       [write_one.("raw", "shaded_with_texture")]
     end
   end
@@ -1340,6 +1361,83 @@ module SuGptRender
   # indistinguishable from white interior walls.
   WINDOW_MARKER_RGB = [255, 0, 255].freeze
 
+  # v0.6.2 — Boost material contrast palette for the Shaded view.
+  # Real HK residential SU files use very similar colours (white walls
+  # #F0F0E8, cream cabinets #E8DCC0, light oak #B8A582) so Image 2's
+  # flat-colour zones blend together and the AI can't reliably tell which
+  # region is which material. When the user toggles "Boost material
+  # contrast" ON, each scoped material is temporarily re-painted with a
+  # synthetic high-contrast colour from this fixed palette so Image 2's
+  # zones become unambiguous.
+  #
+  # Pure magenta #FF00FF is deliberately EXCLUDED — that's already reserved
+  # as the window-opening marker (see WINDOW_MARKER_RGB). If a model has
+  # more than 12 used materials, the palette wraps; the material table
+  # still distinguishes them by name + Original HEX.
+  SEGMENTATION_PALETTE = %w[
+    #FF0000  #00FF00  #0000FF
+    #FFFF00  #00FFFF  #FF8000
+    #80FF00  #0080FF  #8000FF
+    #FF0080  #00FF80  #804000
+  ].freeze
+
+  # Temporarily re-paint each material in `materials` with a colour from
+  # SEGMENTATION_PALETTE, yield, then ALWAYS restore the originals — even
+  # if the block raises. Uses model.start_operation(transparent: true)
+  # + model.abort_operation so the recolour is a silent in-memory edit
+  # that never appears in the user's undo history. CRITICAL: abort runs
+  # in an ensure block so the .skp's material colours are never persisted
+  # to the user's file, even on an exception during capture.
+  #
+  # Belt-and-braces: we also keep an explicit per-material colour snapshot
+  # and re-apply it after abort if the colour didn't come back. Real SU's
+  # abort_operation rolls back in-operation mutations, so the manual
+  # restore is a no-op there; on platforms / stubs where abort doesn't
+  # actually undo, the manual path catches it. Either way the .skp's
+  # material colours are guaranteed to be unchanged after the call.
+  #
+  # Falls through (just yields) if the model has no start_operation —
+  # keeps unit tests with minimal stubs working.
+  def self.with_segmentation_palette(model, materials)
+    return yield unless model && model.respond_to?(:start_operation)
+    materials = (materials || []).compact
+    saved = materials.map { |m| [m, (m.color rescue nil)] }
+    began = false
+    begin
+      began = !!(model.start_operation("hohome_segmentation_capture", true, false, true) rescue nil)
+      materials.each_with_index do |m, idx|
+        hex = SEGMENTATION_PALETTE[idx % SEGMENTATION_PALETTE.length]
+        r = hex[1, 2].to_i(16)
+        g = hex[3, 2].to_i(16)
+        b = hex[5, 2].to_i(16)
+        if defined?(Sketchup::Color)
+          (m.color = Sketchup::Color.new(r, g, b)) rescue nil
+        else
+          (m.color = [r, g, b]) rescue nil
+        end
+      end
+      yield
+    ensure
+      # 1) Abort the silent operation — in real SU this rolls back the
+      #    in-operation colour mutations with no undo-history entry.
+      if began
+        (model.abort_operation rescue nil)
+      end
+      # 2) Defensive per-material restore. Skipped when the colour is
+      #    already back to its original (real SU's abort handled it),
+      #    so we don't add redundant writes that could leak into undo.
+      saved.each do |m, c|
+        next if c.nil?
+        cur = (m.color rescue nil)
+        already_restored =
+          cur && cur.respond_to?(:red) && c.respond_to?(:red) &&
+          cur.red == c.red && cur.green == c.green && cur.blue == c.blue
+        next if already_restored
+        (m.color = c) rescue nil
+      end
+    end
+  end
+
   # Walk the entity tree and collect the materials actually assigned to
   # something — front + back face materials + group/component
   # materials, recursing into definitions. We don't touch the model
@@ -1348,8 +1446,41 @@ module SuGptRender
   # so the multi-view conditioning rules and material-table reference are
   # identical regardless of provider. Single-view falls through to the user
   # prompt unchanged.
-  def self.build_multi_view_preamble(num_views, user_prompt, material_table = nil)
+  def self.build_multi_view_preamble(num_views, user_prompt, material_table = nil, boost_on: nil)
     return user_prompt if num_views < 2
+
+    # If the caller didn't explicitly say, infer from the table header —
+    # collect_model_material_table emits "Original HEX" only when
+    # boost_on:true. This lets call_poe_image_for_live_render and
+    # build_gemini_payload thread the flag through implicitly without
+    # widening their signatures (kept narrow per v0.6.2 design rules).
+    if boost_on.nil?
+      boost_on = material_table.is_a?(String) && material_table.include?("Original HEX")
+    end
+
+    image2_caption =
+      if boost_on
+        # v0.6.2 — Image 2 uses synthetic palette colours, not real ones.
+        <<~I2.chomp
+          • Image 2 (SHADED — SYNTHETIC contrast palette, NOT the materials'
+            actual colours): each material has been temporarily re-painted
+            with a high-contrast palette colour so each region is
+            unambiguous. The "HEX" column in the material table below is
+            that synthetic palette colour — use it ONLY to map "this region
+            in Image 2 = which row in the table". The "Original HEX"
+            column is the REAL material colour you should render. Do NOT
+            paint synthetic palette colours into the output. Geometry is
+            locked by Image 1.
+        I2
+      else
+        <<~I2.chomp
+          • Image 2 (SHADED — flat colour zones, NO texture): tells you
+            which region uses which material. Each visible solid colour
+            matches the HEX column in the material table below; that is
+            how you map "which region is which material". Geometry is
+            locked by Image 1.
+        I2
+      end
 
     views_section = <<~V
       You are receiving #{num_views} views of the SAME 3D scene from the
@@ -1358,11 +1489,7 @@ module SuGptRender
         • Image 1 (HIDDEN-LINE wireframe): EXACT geometry constraint. Every
           edge, corner, and panel division MUST appear in your output — do
           NOT smooth, round, merge, or invent geometry.
-        • Image 2 (SHADED — flat colour zones, NO texture): tells you
-          which region uses which material. Each visible solid colour
-          matches the HEX column in the material table below; that is
-          how you map "which region is which material". Geometry is
-          locked by Image 1.
+      #{image2_caption}
     V
 
     capture_section = <<~CAP
@@ -1378,24 +1505,52 @@ module SuGptRender
 
     table_section =
       if material_table && !material_table.empty?
-        <<~TBL
-          ====== MATERIAL REFERENCE (from active SketchUp model) ======
+        if boost_on
+          <<~TBL
+            ====== MATERIAL REFERENCE (from active SketchUp model) ======
 
-          #{material_table}
+            Image 2 uses a SYNTHETIC contrast palette (not the materials'
+            actual colours) so each material's region is unambiguous. The
+            "HEX" column below is the synthetic palette colour you'll see
+            in Image 2; the "Original HEX" column is the real material
+            colour you should render.
 
-          For every visible coloured region in the render, match it to a row
-          above by HEX and render that region as the named material would
-          look in a real photograph (real wood grain, real fabric weave,
-          real metal sheen, real glass refraction). Do NOT invent materials
-          beyond this list.
+            #{material_table}
 
-          The "Texture ref" column may say "Image N" — those are TEXTURE
-          SWATCHES uploaded as additional input images (after the 2 view
-          captures). Look at swatch image N to see the actual visual
-          appearance of that material; apply that texture/colour/sheen to
-          the matching region in your render. NEVER include the swatch
-          itself as a scene element — it is reference only.
-        TBL
+            For every visible coloured region in Image 2, match its
+            synthetic HEX to a row above, then render that region in the
+            named material's REAL appearance (use the Original HEX as the
+            base colour, plus realistic texture / weave / grain / sheen).
+            Do NOT paint synthetic palette colours into the output. Do NOT
+            invent materials beyond this list.
+
+            The "Texture ref" column may say "Image N" — those are TEXTURE
+            SWATCHES uploaded as additional input images (after the 2 view
+            captures). Look at swatch image N to see the actual visual
+            appearance of that material; apply that texture/colour/sheen to
+            the matching region in your render. NEVER include the swatch
+            itself as a scene element — it is reference only.
+          TBL
+        else
+          <<~TBL
+            ====== MATERIAL REFERENCE (from active SketchUp model) ======
+
+            #{material_table}
+
+            For every visible coloured region in the render, match it to a row
+            above by HEX and render that region as the named material would
+            look in a real photograph (real wood grain, real fabric weave,
+            real metal sheen, real glass refraction). Do NOT invent materials
+            beyond this list.
+
+            The "Texture ref" column may say "Image N" — those are TEXTURE
+            SWATCHES uploaded as additional input images (after the 2 view
+            captures). Look at swatch image N to see the actual visual
+            appearance of that material; apply that texture/colour/sheen to
+            the matching region in your render. NEVER include the swatch
+            itself as a scene element — it is reference only.
+          TBL
+        end
       else
         ""
       end
@@ -1520,7 +1675,16 @@ module SuGptRender
   # extracted-texture list so the table can label each textured material
   # with its uploaded "Image #" — the model can then look up which inline
   # image is the texture swatch for that material.
-  def self.collect_model_material_table(model, texture_meta: [], view_count: 1)
+  #
+  # When boost_on: is true (v0.6.2 — Boost material contrast), the HEX
+  # column shows the SYNTHETIC palette colour each material was repainted
+  # to in Image 2 (the Shaded view), and a 5th "Original HEX" column is
+  # added so Gemini still knows the real material colour to render. The
+  # row order MUST match the order with_segmentation_palette assigned
+  # palette colours (i.e. collect_used_materials order, palette wraps
+  # past index 11), otherwise the synthetic-HEX in the table won't align
+  # with what's visible in Image 2.
+  def self.collect_model_material_table(model, texture_meta: [], view_count: 1, boost_on: false)
     materials = collect_used_materials(model)
     # Map material.object_id → image number (1-indexed, in the order they
     # appear in the request: views first, then textures).
@@ -1530,12 +1694,20 @@ module SuGptRender
     end
 
     rows = []
+    palette_idx = 0
     materials.each do |m|
       next unless m
       name = (m.respond_to?(:display_name) ? m.display_name : m.name).to_s
       next if name.empty?
       c = m.color rescue nil
-      hex = c ? format("#%02X%02X%02X", c.red, c.green, c.blue) : "(none)"
+      real_hex = c ? format("#%02X%02X%02X", c.red, c.green, c.blue) : "(none)"
+      synthetic_hex =
+        if boost_on
+          SEGMENTATION_PALETTE[palette_idx % SEGMENTATION_PALETTE.length]
+        else
+          nil
+        end
+      palette_idx += 1
       tex = (m.respond_to?(:texture) && m.texture) ? m.texture : nil
       tex_hint =
         if tex
@@ -1546,14 +1718,25 @@ module SuGptRender
           alpha && alpha < 0.95 ? "translucent" : "solid"
         end
       img_ref = img_for[m.object_id] ? "Image #{img_for[m.object_id]}" : "—"
-      rows << "| `#{hex}` | #{name} | #{tex_hint} | #{img_ref} |"
+      if boost_on
+        rows << "| `#{synthetic_hex}` | #{name} | #{tex_hint} | #{img_ref} | `#{real_hex}` |"
+      else
+        rows << "| `#{real_hex}` | #{name} | #{tex_hint} | #{img_ref} |"
+      end
     end
     return "" if rows.empty?
     rows = rows.first(30)
-    (
-      ["| HEX | Material name | Hint | Texture ref |",
-       "|---|---|---|---|"] + rows
-    ).join("\n")
+    if boost_on
+      (
+        ["| HEX | Material name | Hint | Texture ref | Original HEX |",
+         "|---|---|---|---|---|"] + rows
+      ).join("\n")
+    else
+      (
+        ["| HEX | Material name | Hint | Texture ref |",
+         "|---|---|---|---|"] + rows
+      ).join("\n")
+    end
   end
 
   def self.with_marker_background(model)
@@ -1689,12 +1872,16 @@ module SuGptRender
     aspect = cfg["live_render_aspect"] || "1:1"   # 1:1, 16:9, 9:16, 4:3, 3:4
     multi  = cfg["live_render_multi_view"] != false   # default ON in v0.5.7+
     upload_textures = cfg["live_render_upload_textures"] != false   # default ON
-    puts "[GPT Render Live] kick: capturing #{width}x#{height} model=#{model} aspect=#{aspect} multi=#{multi} textures=#{upload_textures}"
+    # v0.6.2 — Boost material contrast for the Shaded view. Default OFF;
+    # only meaningful when multi_view is on (single-view doesn't use the
+    # material-table cross-reference).
+    boost_contrast = (cfg["live_render_boost_contrast"] == true) && multi
+    puts "[GPT Render Live] kick: capturing #{width}x#{height} model=#{model} aspect=#{aspect} multi=#{multi} textures=#{upload_textures} boost=#{boost_contrast}"
 
     raw_paths = nil
     texture_meta = []
     begin
-      raw_paths = export_view_for_live_render(width, height, multi_view: multi)
+      raw_paths = export_view_for_live_render(width, height, multi_view: multi, boost_contrast: boost_contrast)
       puts "[GPT Render Live] capture OK: #{raw_paths.length} view(s) → #{raw_paths.map { |p| File.basename(p) }.join(', ')}"
       if upload_textures
         # Drop textures into a sibling subdir so cleanup is one rmtree.
@@ -1710,9 +1897,12 @@ module SuGptRender
     end
     # Material table now references texture image numbers (views are 1..N,
     # textures are N+1..N+T, in the order they're added to the request).
+    # When boost_contrast is on, the table's HEX column shows the synthetic
+    # palette colour with a 5th "Original HEX" column for the real colour.
     mat_table = collect_model_material_table(Sketchup.active_model,
                                              texture_meta: texture_meta,
-                                             view_count: raw_paths.length)
+                                             view_count: raw_paths.length,
+                                             boost_on: boost_contrast)
     texture_paths = texture_meta.map { |t| t[:path] }
     all_input_paths = raw_paths + texture_paths
     # In multi-view mode raw_paths is [geom, shaded]; in single-view it's [shaded].
@@ -1999,6 +2189,7 @@ module SuGptRender
     liver_aspect    = cfg["live_render_aspect"]      || "1:1"
     liver_keep_raw  = cfg["live_render_keep_raw"]    == true
     liver_multi     = cfg["live_render_multi_view"] != false   # default true
+    liver_boost     = cfg["live_render_boost_contrast"] == true  # default false
     liver_model     = cfg["live_render_model"]       || LIVE_RENDER_MODELS.first[0]
     liver_today     = live_render_count_today
     liver_cost      = live_render_cost_today
@@ -2336,6 +2527,14 @@ module SuGptRender
                 <option value="0" #{!liver_multi ? 'selected' : ''}>1 view: Shaded only (legacy / faster)</option>
               </select>
             </label>
+            <label>Boost material contrast for Shaded view
+              <select id="liver_boost" onchange="setLiveRenderBoost()">
+                <option value="0" #{!liver_boost ? 'selected' : ''}>OFF (use real material colours)</option>
+                <option value="1" #{liver_boost  ? 'selected' : ''}>ON (synthetic palette · cleaner segmentation)</option>
+              </select>
+            </label>
+          </div>
+          <div class="grid row">
             <label>Keep raw captures
               <select id="liver_keep_raw" onchange="setLiveRenderKeepRaw()">
                 <option value="0" #{!liver_keep_raw ? 'selected' : ''}>No (auto-delete after render)</option>
@@ -2534,6 +2733,7 @@ module SuGptRender
         function setLiveRenderAspect()    { sketchup.set_live_render_aspect(document.getElementById('liver_aspect').value); }
         function setLiveRenderKeepRaw()   { sketchup.set_live_render_keep_raw(document.getElementById('liver_keep_raw').value); }
         function setLiveRenderMulti()     { sketchup.set_live_render_multi(document.getElementById('liver_multi').value); }
+        function setLiveRenderBoost()     { sketchup.set_live_render_boost_contrast(document.getElementById('liver_boost').value); }
         function setLiveRenderUI(enabled) {
           const btn  = document.getElementById('liver_btn');
           const dot  = document.getElementById('liver_dot');
@@ -2983,6 +3183,9 @@ module SuGptRender
     end
     @tray.add_action_callback("set_live_render_multi") do |_, v|
       cfg = load_config; cfg["live_render_multi_view"] = (v.to_s == "1"); save_config(cfg)
+    end
+    @tray.add_action_callback("set_live_render_boost_contrast") do |_, v|
+      cfg = load_config; cfg["live_render_boost_contrast"] = (v.to_s == "1"); save_config(cfg)
     end
     @tray.add_action_callback("refresh_live_render_materials") do |_, _|
       push_live_render_materials
