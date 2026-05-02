@@ -14,7 +14,7 @@ require 'thread'   # Queue used by Live Stream main↔bg thread handoff
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.5.5"
+  PLUGIN_VERSION = "0.5.6"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -412,6 +412,60 @@ module SuGptRender
     raise "Download HTTP #{res.code}" unless res.is_a?(Net::HTTPSuccess)
     File.binwrite(out_path, res.body)
     out_path
+  end
+
+  # Live Render path through Poe (the cheap one — Nano-Banana / Nano-Banana-Pro).
+  # Maps the live-render id ("nano-banana-poe", "nano-banana-pro-poe") onto
+  # the Poe bot name ("Nano-Banana", "Nano-Banana-Pro"), POSTs image + prompt,
+  # parses the markdown image URL out of the response, downloads it next to
+  # the input PNG. Returns [output_path, completion_tokens] so the cost meter
+  # can use the per-model rate from LIVE_RENDER_MODELS.
+  def self.call_poe_image_for_live_render(input_image_path, prompt, live_render_id)
+    cfg = load_config
+    api_key = cfg["poe_api_key"].to_s
+    raise "Poe API key missing — set it in tray Render tab" if api_key.empty?
+
+    # Map live_render id → actual Poe bot name.
+    poe_model = case live_render_id
+                when "nano-banana-poe"     then "Nano-Banana"
+                when "nano-banana-pro-poe" then "Nano-Banana-Pro"
+                else live_render_id
+                end
+
+    # Build the same payload call_poe builds, but capture usage too — call_poe
+    # only returns the URL, so we duplicate the request body here.
+    img_b64 = Base64.strict_encode64(File.binread(input_image_path))
+    payload = {
+      "model"    => poe_model,
+      "messages" => [{
+        "role" => "user",
+        "content" => [
+          { "type" => "text", "text" => prompt },
+          { "type" => "image_url",
+            "image_url" => { "url" => "data:image/png;base64,#{img_b64}" } }
+        ]
+      }],
+      "stream" => false,
+    }
+    res = http_post_json(POE_ENDPOINT,
+      { "Authorization" => "Bearer #{api_key}", "Content-Type" => "application/json" },
+      JSON.generate(payload))
+    raise "Poe API HTTP #{res.code}: #{res.body[0,400]}" unless res.is_a?(Net::HTTPSuccess)
+    j = JSON.parse(res.body) rescue {}
+    content = j.dig("choices", 0, "message", "content").to_s
+    url_match = content.match(/!\[[^\]]*\]\(([^)\s]+)\)/) ||
+                content.match(/(https?:\/\/[^\s)\]]+)/)
+    raise "Poe returned no image URL: #{content[0,300]}" unless url_match
+    img_url = url_match[1]
+
+    # Save next to input.
+    in_dir = File.dirname(input_image_path)
+    base = File.basename(input_image_path, ".*")
+    out_path = File.join(in_dir, "#{base}_render.png")
+    download(img_url, out_path)
+
+    completion_tokens = (j.dig("usage", "completion_tokens") || 1290).to_i
+    [out_path, completion_tokens]
   end
 
   # Vision (text+image → text) — used by AI Watch. Returns the model's text answer.
@@ -1099,24 +1153,45 @@ module SuGptRender
     that aren't already present in the scene.
   P
 
-  # Image-output models for the Live Render dropdown. First entry = default.
-  # Easy to extend later (gemini-3-pro-image-preview, etc.) without touching
-  # the call code — call_gemini_image just passes `model:` through.
+  # Image-output models for Live Render. Each entry: [id, label, hint, provider, output_$/M_token, est_per_image_$].
+  #
+  # Two providers wired up:
+  #   :poe      → POE_ENDPOINT, returns markdown image URL on Poe CDN
+  #   :gateway  → CF AI Gateway, returns inline base64 PNG (gemini-*-image direct)
+  #
+  # Pricing observation (verified empirically against both APIs):
+  # Poe charges per-token at unified text rate, NOT the Google image-token
+  # premium ($30/M for 2.5-flash-image, $120/M for 3-pro-image). So Poe is
+  # 7-17× cheaper for image-out models — Google may be subsidising Poe's
+  # bulk traffic, or Poe may be subsidising it themselves; either way the
+  # rate-card you're billed against is what we encode here.
+  #
+  # PRIVACY CAVEAT for Poe paths: rendered images live at pfst.cf2.poecdn.net
+  # for ~hours-days; anyone with the URL can view. Use :gateway for client-
+  # confidential designs.
   LIVE_RENDER_MODELS = [
-    ["gemini-2.5-flash-image", "Gemini 2.5 Flash Image", "Google · ~10s · ~$0.0005/render"],
+    ["nano-banana-poe",         "Nano-Banana (Poe) · cheapest ⭐",
+       "Google 2.5 Flash Image via Poe · ~$0.002/img (HK$0.018) · 13s · DEFAULT for mood-board",
+       :poe, 1.77e-6, 0.0023],
+    ["nano-banana-pro-poe",     "Nano-Banana Pro (Poe) · best quality",
+       "Google 3 Pro Image via Poe · ~$0.018/img (HK$0.14) · 33s · slower but sharper",
+       :poe, 12.12e-6, 0.0175],
+    ["gemini-2.5-flash-image",  "Gemini 2.5 Flash Image (CF Gateway · private)",
+       "Google direct via CF AI Gateway · ~$0.039/img (HK$0.31) · 12s · CONFIDENTIAL projects (no Poe CDN)",
+       :gateway, 30.0e-6, 0.0387],
+    ["gemini-3-pro-image-preview", "Gemini 3 Pro Image (CF Gateway · private)",
+       "Google direct via CF AI Gateway · ~$0.134/img (HK$1.05) · 13s · CONFIDENTIAL + highest quality",
+       :gateway, 120.0e-6, 0.1340],
   ].freeze
 
-  # Per-call cost = (image-output tokens) × ($0.40 / 1e6). Empirical: a single
-  # 1024² PNG returns ~1290 tokens → ~$0.000516. We compute the meter from
-  # the actual recorded tokens (summed across today's renders) so it stays
-  # honest as the model evolves.
-  # IMPORTANT: gemini-2.5-flash-image is billed at $30/M output tokens
-  # (Google's official rate, see https://ai.google.dev/gemini-api/docs/pricing).
-  # That's 75× the text-output rate ($0.40/M) — earlier versions used the
-  # text rate by mistake and showed costs 75× too low. 1290 tokens × $30/M
-  # = $0.0387 ≈ $0.039 / image, which matches Google's flat per-image quote.
-  # NOTE: image generation has NO free tier, even on the lowest paid plan.
-  LIVE_RENDER_OUTPUT_PRICE_PER_TOKEN = 30.0e-6
+  # Per-model lookup. Build once.
+  def self.live_render_model_meta(id)
+    LIVE_RENDER_MODELS.find { |row| row[0] == id } || LIVE_RENDER_MODELS.first
+  end
+
+  def self.live_render_provider_for(id);     live_render_model_meta(id)[3]; end
+  def self.live_render_rate_for(id);         live_render_model_meta(id)[4]; end
+  def self.live_render_per_image_cost(id);   live_render_model_meta(id)[5]; end
 
   # Capture the current view as a PNG sized for image-input. We send PNG (not
   # JPEG) because gemini-2.5-flash-image happily accepts both and PNG keeps
@@ -1268,6 +1343,7 @@ module SuGptRender
     push_live_render_status("Rendering (#{model}) ~10s…", "busy")
     puts "[GPT Render Live] kick: bg thread starting…"
 
+    provider = live_render_provider_for(model)
     @liverender[:bg_thread] = Thread.new do
       q = @liverender[:queue]
       started = Time.now
@@ -1277,12 +1353,17 @@ module SuGptRender
           q << [:flight_done, nil] if q
           next
         end
-        render_path, tokens = call_gemini_image(raw_path, prompt,
-                                                model: model,
-                                                input_mime: "image/png",
-                                                aspect_ratio: aspect)
+        render_path, tokens =
+          if provider == :poe
+            call_poe_image_for_live_render(raw_path, prompt, model)
+          else
+            call_gemini_image(raw_path, prompt,
+                              model: model,
+                              input_mime: "image/png",
+                              aspect_ratio: aspect)
+          end
         elapsed = (Time.now - started).round(1)
-        puts "[GPT Render Live] render OK: #{render_path} (#{tokens} tokens, #{elapsed}s)"
+        puts "[GPT Render Live] render OK (#{provider}): #{render_path} (#{tokens} tokens, #{elapsed}s)"
         # Default: drop the raw SU view we just sent — only the AI render is
         # interesting to keep. Set live_render_keep_raw=true in config to
         # retain both for debugging / before-after comparison.
@@ -1347,7 +1428,7 @@ module SuGptRender
       @liverender[:history] = @liverender[:history].first(@liverender[:history_max])
     end
     log_live_render(entry)
-    bump_live_render_count(entry[:tokens] || 0)
+    bump_live_render_count(entry[:tokens] || 0, entry[:model])
   end
 
   def self.log_live_render(entry)
@@ -1369,13 +1450,19 @@ module SuGptRender
     }
   end
 
-  def self.bump_live_render_count(tokens = 0)
+  def self.bump_live_render_count(tokens = 0, model = nil)
     cfg = load_config
     today = Time.now.strftime("%Y-%m-%d")
     cfg["live_render_counts"] ||= {}
     cfg["live_render_counts"][today] = (cfg["live_render_counts"][today] || 0) + 1
     cfg["live_render_tokens"] ||= {}
     cfg["live_render_tokens"][today] = (cfg["live_render_tokens"][today] || 0) + tokens.to_i
+    # USD running total — uses per-model rate so Poe vs Gateway costs sum correctly
+    rate = live_render_rate_for(model || cfg["live_render_model"])
+    cost_delta = (tokens.to_i * rate)
+    cfg["live_render_cost_usd"] ||= {}
+    cfg["live_render_cost_usd"][today] =
+      ((cfg["live_render_cost_usd"][today] || 0.0) + cost_delta).round(6)
     save_config(cfg)
   end
 
@@ -1391,11 +1478,20 @@ module SuGptRender
     (cfg["live_render_tokens"] || {})[today] || 0
   end
 
-  # Cost = today's image-output tokens × per-token price. Rounded to 4 d.p.
-  # so 1¢ thresholds show on the meter (a single render is ~$0.0005).
+  # Daily cost — sum across whatever models the user invoked today (each
+  # bump applies the model's own rate). For schemas migrated from earlier
+  # versions that only have :live_render_tokens, fall back to assuming the
+  # current default model's rate so old data still shows ~something useful.
   def self.live_render_cost_today
+    cfg = load_config
+    today = Time.now.strftime("%Y-%m-%d")
+    if cfg["live_render_cost_usd"] && cfg["live_render_cost_usd"][today]
+      return cfg["live_render_cost_usd"][today].to_f.round(4)
+    end
+    # Legacy fallback for pre-v0.5.6 data that only stored tokens
     tokens = live_render_tokens_today
-    (tokens * LIVE_RENDER_OUTPUT_PRICE_PER_TOKEN).round(4)
+    rate = live_render_rate_for(cfg["live_render_model"] || LIVE_RENDER_MODELS.first[0])
+    (tokens * rate).round(4)
   end
 
   # Approximate USD→HKD. Pegged 7.75–7.85 since 1983; using 7.85 covers
@@ -1510,10 +1606,16 @@ module SuGptRender
     liver_today     = live_render_count_today
     liver_cost      = live_render_cost_today
     liver_history_html = render_live_render_history_html
-    liver_model_options = LIVE_RENDER_MODELS.map { |id, label, hint|
+    liver_model_options = LIVE_RENDER_MODELS.map { |row|
+      id, label, hint, _provider, _rate, per_img = row
       sel = (id == liver_model) ? " selected" : ""
-      "<option value=\"#{id}\"#{sel}>#{CGI.escapeHTML(label)} — #{CGI.escapeHTML(hint)}</option>"
+      # Show "label — hint" — hint already includes price + use-case advice
+      "<option value=\"#{id}\"#{sel} title=\"#{CGI.escapeHTML(hint)}\">" \
+        "#{CGI.escapeHTML(label)} — #{CGI.escapeHTML(hint)}</option>"
     }.join("\n")
+    liver_provider     = live_render_provider_for(liver_model)
+    liver_per_image    = live_render_per_image_cost(liver_model)
+    liver_per_image_hk = (liver_per_image * USD_TO_HKD).round(3)
 
     model_options_html = IMAGE_MODELS.map { |id, label, hint|
       sel = (id == selected_model) ? " selected" : ""
@@ -1842,8 +1944,8 @@ module SuGptRender
 
           <div class="info-grid">
             <div>Today</div><div id="liver_today">#{liver_today} renders · ~US$#{format('%.4f', liver_cost)} (HK$#{format('%.3f', liver_cost * USD_TO_HKD)})</div>
-            <div>Output</div><div>1024×1024 PNG (model-fixed) · ~$0.0005 / render</div>
-            <div>Endpoint</div><div><code>gemini-2.5-flash-image · generateContent</code></div>
+            <div>Per render</div><div>~US$#{format('%.4f', liver_per_image)} (HK$#{format('%.3f', liver_per_image_hk)}) at the selected model</div>
+            <div>Provider</div><div><code>#{liver_provider == :poe ? 'Poe (cheap, public CDN)' : 'CF AI Gateway (private, direct Google)'}</code></div>
           </div>
 
           <h3>Captured frame &nbsp;→&nbsp; AI Render</h3>

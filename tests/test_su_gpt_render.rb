@@ -1064,7 +1064,7 @@ end
 
 class TestVersionBump < Minitest::Test
   # Single source of truth — bump when releasing.
-  EXPECTED_VERSION = "0.5.5"
+  EXPECTED_VERSION = "0.5.6"
 
   def test_plugin_version_matches_expected
     assert_equal EXPECTED_VERSION, SuGptRender::PLUGIN_VERSION
@@ -1219,7 +1219,24 @@ class TestImageModelsConstant < Minitest::Test
 
   def test_live_render_models_constant
     assert SuGptRender.const_defined?(:LIVE_RENDER_MODELS)
-    assert_equal "gemini-2.5-flash-image", SuGptRender::LIVE_RENDER_MODELS.first[0]
+    # As of v0.5.6 the default switched to Poe Nano-Banana (~17× cheaper).
+    # Each entry now also carries provider + per-token rate + per-image cost.
+    first = SuGptRender::LIVE_RENDER_MODELS.first
+    assert_equal "nano-banana-poe", first[0], "Poe Nano-Banana should be default"
+    assert_equal :poe, first[3], "first entry must be a Poe-routed model"
+  end
+
+  def test_live_render_models_have_both_providers
+    providers = SuGptRender::LIVE_RENDER_MODELS.map { |row| row[3] }.uniq
+    assert_includes providers, :poe,     "must offer at least one Poe-routed model"
+    assert_includes providers, :gateway, "must offer at least one direct-Google option (privacy)"
+  end
+
+  def test_live_render_provider_lookup
+    assert_equal :poe,     SuGptRender.live_render_provider_for("nano-banana-poe")
+    assert_equal :gateway, SuGptRender.live_render_provider_for("gemini-2.5-flash-image")
+    # Unknown id falls back to default (first entry)
+    assert_equal :poe,     SuGptRender.live_render_provider_for("nonexistent")
   end
 end
 
@@ -1398,29 +1415,40 @@ class TestLiveRenderCost < Minitest::Test
     assert_equal 2580, cfg["live_render_tokens"][today]
   end
 
-  def test_cost_today_for_known_token_count
-    # 1290 image-output tokens × $30/M = $0.0387 ≈ Google's $0.039 per image.
-    # gemini-2.5-flash-image's actual rate; image gen has no free tier.
-    SuGptRender.bump_live_render_count(1290)
+  def test_cost_today_default_model_poe_rate
+    # As of v0.5.6, the default model is Poe Nano-Banana at $1.77/M output.
+    # 1290 output tokens × 1.77e-6 = $0.0023 per image.
+    SuGptRender.bump_live_render_count(1290, "nano-banana-poe")
     cost = SuGptRender.live_render_cost_today
-    assert_in_delta 0.0387, cost, 0.001,
-      "1290 tokens at $30/M ≈ $0.039 / image, got #{cost}"
+    assert_in_delta 0.0023, cost, 0.0005,
+      "1290 tokens via Poe at $1.77/M ≈ $0.0023, got #{cost}"
   end
 
-  def test_cost_today_scales_with_tokens
-    # 20 renders × 1290 tokens = 25800 tokens × 30e-6 = $0.774
-    20.times { SuGptRender.bump_live_render_count(1290) }
+  def test_cost_today_gateway_rate_higher
+    # Same 1290 tokens via CF Gateway (gemini-2.5-flash-image) hits the
+    # Google image-token premium at $30/M. 17× the Poe path.
+    SuGptRender.bump_live_render_count(1290, "gemini-2.5-flash-image")
     cost = SuGptRender.live_render_cost_today
-    assert_in_delta 0.774, cost, 0.01,
-      "20 renders at $0.0387/each ≈ $0.774, got #{cost}"
+    assert_in_delta 0.0387, cost, 0.001,
+      "1290 tokens via CF Gateway at $30/M ≈ $0.039, got #{cost}"
+  end
+
+  def test_cost_today_mixed_models_sum_correctly
+    # The cost meter must use the rate of the model that produced each
+    # render. 1× Poe + 1× Gateway should be the SUM, not 2× either rate.
+    SuGptRender.bump_live_render_count(1290, "nano-banana-poe")
+    SuGptRender.bump_live_render_count(1290, "gemini-2.5-flash-image")
+    cost = SuGptRender.live_render_cost_today
+    assert_in_delta (0.0023 + 0.0387), cost, 0.001,
+      "mixed-model day must sum per-rate, got #{cost}"
   end
 
   def test_cost_today_in_hkd
-    # 1290 tokens × $30/M × 7.85 ≈ HK$0.304
-    SuGptRender.bump_live_render_count(1290)
+    # 1290 tokens × $1.77/M × 7.85 ≈ HK$0.018 (Poe default)
+    SuGptRender.bump_live_render_count(1290, "nano-banana-poe")
     cost_hkd = SuGptRender.live_render_cost_today_hkd
-    assert_in_delta 0.304, cost_hkd, 0.01,
-      "1290 tokens ≈ HK$0.30, got HK$#{cost_hkd}"
+    assert_in_delta 0.018, cost_hkd, 0.005,
+      "default Poe path ≈ HK$0.018, got HK$#{cost_hkd}"
   end
 end
 

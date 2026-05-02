@@ -1,5 +1,5 @@
 {
-  "version": "0.5.5",
+  "version": "0.5.6",
   "rb_url": "https://hohomehk-plugin.ngrok.app/su_gpt_render.rb",
-  "notes": "v0.5.5 — Live Render output is no longer locked to 1024×1024. New aspect-ratio dropdown (1:1, 16:9 widescreen, 9:16 portrait, 4:3, 3:4) plumbs through generationConfig.imageConfig.aspectRatio. All ratios cost the same $0.039/render (1290 image tokens regardless of shape). 16:9 = 1344×768 — better fit for typical SU widescreen viewports than the square default."
+  "notes": "v0.5.6 — Live Render gets a model dropdown with 4 cost-tiered options. New default is Nano-Banana via Poe at $0.0023/render (HK$0.018), 17× cheaper than the previous CF AI Gateway path. Pricing observed empirically: Poe charges per-token at unified text rate, while Google direct charges $30/M (2.5 image) or $120/M (3-pro image) for image-output tokens. Privacy caveat: Poe-rendered images live on pfst.cf2.poecdn.net for hours-days; pick a CF Gateway option (gemini-2.5-flash-image / gemini-3-pro-image-preview) for confidential client work. UI now shows per-render cost in both USD and HKD next to the model name."
 }
