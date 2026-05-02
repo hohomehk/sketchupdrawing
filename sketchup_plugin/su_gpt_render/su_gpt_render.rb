@@ -14,7 +14,7 @@ require 'thread'   # Queue used by Live Stream main↔bg thread handoff
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.5.9"
+  PLUGIN_VERSION = "0.6.0"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -420,7 +420,7 @@ module SuGptRender
   # parses the markdown image URL out of the response, downloads it next to
   # the input PNG. Returns [output_path, completion_tokens] so the cost meter
   # can use the per-model rate from LIVE_RENDER_MODELS.
-  def self.call_poe_image_for_live_render(input_image_paths, prompt, live_render_id)
+  def self.call_poe_image_for_live_render(input_image_paths, prompt, live_render_id, material_table: nil)
     paths = Array(input_image_paths)   # accept either a single path or [geom, material]
     raise "no input images" if paths.empty?
     cfg = load_config
@@ -434,30 +434,7 @@ module SuGptRender
                 else live_render_id
                 end
 
-    # Multi-view: prepend a structural-conditioning preamble before the user
-    # prompt so the model treats each image with the right role. Single-view
-    # falls through to the original prompt.
-    final_prompt = if paths.length >= 2
-      <<~MULTI
-        You are receiving #{paths.length} views of the SAME 3D scene from the
-        SAME camera. Treat each view as a different conditioning signal:
-
-          • Image 1 (HIDDEN-LINE wireframe): EXACT geometry constraint. Every
-            edge, corner, and panel division in this image MUST appear in
-            your output — do NOT smooth, round, merge, or invent geometry.
-          • Image 2 (SHADED with materials): use ONLY for material / colour
-            assignment. Geometry is locked by Image 1; do not extract layout
-            from this view.
-        #{paths.length >= 3 ? "  • Image 3 (MONOCHROME shape): supplementary 3-D shape reference.\n" : ""}
-        Your render must combine: Image 1's geometry + Image 2's materials +
-        the user's stylistic instruction below.
-
-        ====== USER INSTRUCTION ======
-        #{prompt}
-      MULTI
-    else
-      prompt
-    end
+    final_prompt = build_multi_view_preamble(paths.length, prompt, material_table)
 
     content_arr = [{ "type" => "text", "text" => final_prompt }]
     paths.each do |p|
@@ -532,37 +509,14 @@ module SuGptRender
   def self.build_gemini_payload(image_path_or_paths, prompt,
                                 model: "gemini-2.5-flash",
                                 mime_type: "image/jpeg", max_output_tokens: 1024,
-                                aspect_ratio: nil)
+                                aspect_ratio: nil, material_table: nil)
     paths = Array(image_path_or_paths)
     raise "no input images" if paths.empty?
     parts = paths.map { |p|
       img_b64 = Base64.strict_encode64(File.binread(p))
       { "inlineData" => { "mimeType" => mime_type, "data" => img_b64 } }
     }
-
-    # Multi-view conditioning preamble (same content as Poe path so the two
-    # providers behave identically when fed the same captures).
-    final_prompt = if paths.length >= 2
-      <<~MULTI
-        You are receiving #{paths.length} views of the SAME 3D scene from the
-        SAME camera. Treat each view as a different conditioning signal:
-
-          • Image 1 (HIDDEN-LINE wireframe): EXACT geometry constraint. Every
-            edge, corner, and panel division MUST appear in your output — do
-            NOT smooth, round, merge, or invent geometry.
-          • Image 2 (SHADED with materials): use ONLY for material / colour
-            assignment. Geometry is locked by Image 1.
-
-        Your render = Image 1's geometry + Image 2's materials + the user
-        instruction below.
-
-        ====== USER INSTRUCTION ======
-        #{prompt}
-      MULTI
-    else
-      prompt
-    end
-
+    final_prompt = build_multi_view_preamble(paths.length, prompt, material_table)
     parts << { "text" => final_prompt }
     body = { "contents" => [{ "parts" => parts }] }
     # Image-output models (gemini-2.5-flash-image et al.) do NOT accept
@@ -623,12 +577,14 @@ module SuGptRender
   def self.call_gemini_image(input_image_path_or_paths, prompt,
                              model: "gemini-2.5-flash-image",
                              input_mime: "image/png",
-                             aspect_ratio: nil)
+                             aspect_ratio: nil,
+                             material_table: nil)
     paths = Array(input_image_path_or_paths)
     url = "#{GEMINI_AIG_URL}/v1beta/models/#{model}:generateContent"
     payload = build_gemini_payload(paths, prompt,
                                    model: model, mime_type: input_mime,
-                                   aspect_ratio: aspect_ratio)
+                                   aspect_ratio: aspect_ratio,
+                                   material_table: material_table)
     res = http_post_json(url, gemini_aig_headers, JSON.generate(payload))
     unless res.is_a?(Net::HTTPSuccess)
       raise "Gemini Image AI Gateway HTTP #{res.code}: #{res.body[0,300]}"
@@ -1266,11 +1222,13 @@ module SuGptRender
     write_one = ->(suffix, style) {
       out = File.join(out_dir, "#{timestamp}_#{base}_lr_#{suffix}.png")
       with_face_style(model, style) do
-        with_flat_lighting(model) do
-          ok = model.active_view.write_image(filename: out, width: width,
-                                             height: height, antialias: true,
-                                             transparent: false)
-          raise "write_image #{suffix} failed" unless ok
+        with_marker_background(model) do
+          with_flat_lighting(model) do
+            ok = model.active_view.write_image(filename: out, width: width,
+                                               height: height, antialias: true,
+                                               transparent: false)
+            raise "write_image #{suffix} failed" unless ok
+          end
         end
       end
       out
@@ -1318,6 +1276,194 @@ module SuGptRender
       if ro && !saved.nil?
         ro["RenderMode"] = saved rescue nil
         model.active_view.refresh rescue nil
+      end
+    end
+  end
+
+  # Pure magenta — a colour that effectively never appears in real interior
+  # photos, so AI image models treat it as a marker rather than as material.
+  # Used to paint the SU "world view" (sky/ground beyond walls) while the
+  # capture runs, so window openings stand out as magenta instead of being
+  # indistinguishable from white interior walls.
+  WINDOW_MARKER_RGB = [255, 0, 255].freeze
+
+  # Walk the entity tree and collect the materials actually assigned to
+  # something — front + back face materials + group/component
+  # materials, recursing into definitions. We don't touch the model
+  # (no `purge_unused`), so the user's clutter library stays as-is.
+  # Shared preamble builder — both Poe and CF Gateway image paths use this
+  # so the multi-view conditioning rules and material-table reference are
+  # identical regardless of provider. Single-view falls through to the user
+  # prompt unchanged.
+  def self.build_multi_view_preamble(num_views, user_prompt, material_table = nil)
+    return user_prompt if num_views < 2
+
+    views_section = <<~V
+      You are receiving #{num_views} views of the SAME 3D scene from the
+      SAME camera. Treat each view as a different conditioning signal:
+
+        • Image 1 (HIDDEN-LINE wireframe): EXACT geometry constraint. Every
+          edge, corner, and panel division MUST appear in your output — do
+          NOT smooth, round, merge, or invent geometry.
+        • Image 2 (SHADED with materials): use ONLY for material / colour
+          assignment. Geometry is locked by Image 1.
+    V
+
+    capture_section = <<~CAP
+      IMPORTANT — capture convention:
+        • Any pure MAGENTA (#FF00FF) regions in the views are NOT walls or
+          surfaces. They are OPENINGS — windows, doors, or arches — where
+          the scene sees through to the outside world. Replace each magenta
+          region with a realistic outdoor view through a transparent glass
+          pane appropriate to a Hong Kong residential setting (distant
+          building façades, sky, soft daylight). NEVER render magenta as
+          a colour itself.
+    CAP
+
+    table_section =
+      if material_table && !material_table.empty?
+        <<~TBL
+          ====== MATERIAL REFERENCE (from active SketchUp model) ======
+
+          #{material_table}
+
+          The HEX value in column 1 is the RGB colour you will see in the
+          shaded view (Image 2). For every visible coloured region in the
+          render, match it to a row above and render that region as the
+          named material would look in a real photograph (real wood grain,
+          real fabric weave, real metal sheen, real glass refraction, etc.).
+          Do NOT invent materials beyond this list. If a region's colour
+          matches multiple rows, pick the one whose name best fits its
+          architectural role (e.g. cabinet door vs floor).
+        TBL
+      else
+        ""
+      end
+
+    [views_section.chomp, "",
+     capture_section.chomp, "",
+     table_section.chomp, "",
+     "====== USER INSTRUCTION ======",
+     user_prompt
+    ].reject(&:empty?).join("\n\n")
+  end
+
+  # Scope priority (a .skp may hold many rooms; only the active one matters):
+  #   1. Active selection (if any)
+  #   2. Currently-edited container (user double-clicked into a Group/Comp)
+  #   3. Whole model (fallback)
+  # Returns [enumerable_entities, scope_label_string].
+  def self.live_render_material_scope(model)
+    return [nil, "(none)"] unless model
+    sel = (model.selection rescue nil)
+    if sel && !sel.empty?
+      return [sel.to_a, "selection (#{sel.size} entities)"]
+    end
+    active = (model.active_entities rescue nil)
+    if active && active.respond_to?(:object_id) &&
+       (model.entities rescue nil) &&
+       active.object_id != model.entities.object_id
+      label = "open container"
+      ap = (model.active_path rescue nil)
+      if ap && !ap.empty?
+        last = ap.last
+        nm = (last.respond_to?(:definition) ? last.definition.name : last.name) rescue nil
+        label = "open container · #{nm}" if nm && !nm.empty?
+      end
+      return [active, label]
+    end
+    [model.entities, "whole model"]
+  end
+
+  def self.collect_used_materials(model)
+    return [] unless model && model.respond_to?(:entities)
+    scope, label = live_render_material_scope(model)
+    return [] unless scope
+    puts "[GPT Render Live] material scope: #{label}"
+    seen = {}   # object_id → material (dedup)
+    visit = lambda do |entities|
+      next unless entities
+      entities.each do |e|
+        next unless e
+        mat = (e.material rescue nil)
+        seen[mat.object_id] = mat if mat
+        bm = (e.respond_to?(:back_material) ? (e.back_material rescue nil) : nil)
+        seen[bm.object_id] = bm if bm
+        defn = if e.is_a?(Sketchup::Group)
+                 (e.respond_to?(:definition) ? (e.definition rescue nil) : (e.entities rescue nil))
+               elsif e.is_a?(Sketchup::ComponentInstance)
+                 (e.respond_to?(:definition) ? (e.definition rescue nil) : nil)
+               end
+        if defn
+          inner = (defn.respond_to?(:entities) ? defn.entities : defn)
+          visit.call(inner) if inner
+        end
+      end
+    end
+    visit.call(scope)
+    seen.values
+  end
+
+  # Markdown table of in-use materials only (purge-unused-style filtering
+  # without mutating the .skp). Each row: hex colour → human-readable name
+  # → texture-or-solid hint. Typical interior project: 5-15 rows.
+  #
+  # Sits inside the prompt preamble; cost is ~50-200 extra input tokens,
+  # ≈ negligible. Capped to 30 rows to keep prompt size sane on huge models.
+  def self.collect_model_material_table(model)
+    materials = collect_used_materials(model)
+    rows = []
+    materials.each do |m|
+      next unless m
+      name = (m.respond_to?(:display_name) ? m.display_name : m.name).to_s
+      next if name.empty?
+      c = m.color rescue nil
+      rgb_hex = c ? format("#%02X%02X%02X", c.red, c.green, c.blue) : "(none)"
+      tex = (m.respond_to?(:texture) && m.texture) ? m.texture : nil
+      tex_hint =
+        if tex
+          fn = (tex.filename rescue "") || ""
+          fn.empty? ? "textured" : "texture: #{File.basename(fn)}"
+        else
+          "solid"
+        end
+      alpha = m.respond_to?(:alpha) ? (m.alpha rescue 1.0) : 1.0
+      tx = (alpha && alpha < 0.95) ? " · #{format('%.0f%%', alpha * 100)} opacity" : ""
+      rows << "| `#{rgb_hex}` | #{name} | #{tex_hint}#{tx} |"
+    end
+    return "" if rows.empty?
+    rows = rows.first(30)
+    (
+      ["| HEX | Material name | Hint |",
+       "|---|---|---|"] + rows
+    ).join("\n")
+  end
+
+  def self.with_marker_background(model)
+    ro = model.rendering_options rescue nil
+    saved = {}
+    keys = ["BackgroundColor", "SkyColor", "GroundColor", "DrawHorizon",
+            "DrawGround", "DisplayHorizon", "DisplayGround", "DisplaySky",
+            "BackgroundColorIsCustom"]
+    if ro
+      keys.each { |k| saved[k] = ro[k] rescue nil }
+      magenta = (defined?(Sketchup::Color) ? Sketchup::Color.new(*WINDOW_MARKER_RGB) : WINDOW_MARKER_RGB) rescue nil
+      if magenta
+        ro["BackgroundColor"] = magenta rescue nil
+        ro["SkyColor"]        = magenta rescue nil
+        ro["GroundColor"]     = magenta rescue nil
+      end
+      ro["DrawHorizon"]    = false rescue nil
+      ro["DrawGround"]     = false rescue nil
+      ro["DisplayHorizon"] = false rescue nil
+      ro["DisplayGround"]  = false rescue nil
+      ro["DisplaySky"]     = false rescue nil
+    end
+    begin
+      yield
+    ensure
+      if ro
+        saved.each { |k, v| ro[k] = v rescue nil unless v.nil? }
       end
     end
   end
@@ -1425,7 +1571,9 @@ module SuGptRender
     height = (cfg["live_render_height"] || 1024).to_i
     aspect = cfg["live_render_aspect"] || "1:1"   # 1:1, 16:9, 9:16, 4:3, 3:4
     multi  = cfg["live_render_multi_view"] != false   # default ON in v0.5.7+
-    puts "[GPT Render Live] kick: capturing #{width}x#{height} model=#{model} aspect=#{aspect} multi=#{multi}"
+    mat_table = collect_model_material_table(Sketchup.active_model)
+    @liverender[:current_material_table] = mat_table   # exposed for UI preview
+    puts "[GPT Render Live] kick: capturing #{width}x#{height} model=#{model} aspect=#{aspect} multi=#{multi} materials=#{mat_table.lines.size} rows"
 
     raw_paths = nil
     begin
@@ -1457,12 +1605,14 @@ module SuGptRender
         end
         render_path, tokens =
           if provider == :poe
-            call_poe_image_for_live_render(raw_paths, prompt, model)
+            call_poe_image_for_live_render(raw_paths, prompt, model,
+                                            material_table: mat_table)
           else
             call_gemini_image(raw_paths, prompt,
                               model: model,
                               input_mime: "image/png",
-                              aspect_ratio: aspect)
+                              aspect_ratio: aspect,
+                              material_table: mat_table)
           end
         elapsed = (Time.now - started).round(1)
         puts "[GPT Render Live] render OK (#{provider}): #{render_path} (#{tokens} tokens, #{elapsed}s)"
@@ -1619,6 +1769,7 @@ module SuGptRender
   @recurring_update_timer ||= nil
   @update_thread         ||= nil
   @update_poll_timer     ||= nil
+  @liverender_material_timer ||= nil
   # AI Watch state
   @aiwatch               ||= {
     enabled:        false,
@@ -2062,6 +2213,12 @@ module SuGptRender
             <div>Provider</div><div><code>#{liver_provider == :poe ? 'Poe (cheap, public CDN)' : 'CF AI Gateway (private, direct Google)'}</code></div>
           </div>
 
+          <h3 style="display:flex;align-items:center;justify-content:space-between;">
+            <span>Materials Gemini will use</span>
+            <button class="small" onclick="cmd('refresh_live_render_materials')" style="margin-left:8px;font-size:11px;">↻ Refresh</button>
+          </h3>
+          <div id="liver_materials" style="background:#0a0a0a;border:1px solid #2a2a2a;border-radius:4px;padding:8px;font-size:11.5px;line-height:1.5;color:#cfc;max-height:140px;overflow-y:auto;"></div>
+
           <h3>Captured views &nbsp;→&nbsp; AI Render</h3>
           <div id="liver_grid" style="display:grid;grid-template-columns:repeat(3, 1fr);gap:8px;">
             <div class="preview liver-cell" style="min-height:120px">
@@ -2267,6 +2424,23 @@ module SuGptRender
           else if (side === 'in')   url = liverInUrl;
           else                      url = liverOutUrl;
           if (url) sketchup.open_url(url);
+        }
+        // Renders the markdown material table sent in the next render call.
+        // payload: { rows: [[hex, name, hint], ...], scope_label: "..." }
+        function renderLiveRenderMaterials(payload) {
+          const el = document.getElementById('liver_materials');
+          if (!el) return;
+          if (!payload || !payload.rows || payload.rows.length === 0) {
+            el.innerHTML = '<div style="opacity:.5">No materials in scope.</div>';
+            return;
+          }
+          const swatch = (hex) => `<span style="display:inline-block;width:12px;height:12px;background:${hex};border:1px solid #444;vertical-align:middle;margin-right:6px;border-radius:2px;"></span>`;
+          const rowsHtml = payload.rows.map(r =>
+            `<div style="display:flex;align-items:center;gap:6px;font-family:monospace;">
+              ${swatch(r[0])}<code>${r[0]}</code> · <span>${r[1]}</span><span style="opacity:.5;font-size:10px;margin-left:auto;">${r[2]||''}</span>
+            </div>`).join('');
+          const scope = payload.scope_label ? `<div style="opacity:.6;font-size:10px;margin-bottom:4px;">scope: ${payload.scope_label} · ${payload.rows.length} materials</div>` : '';
+          el.innerHTML = scope + rowsHtml;
         }
         function setLiveRenderHistory(html) {
           const h = document.getElementById('liver_history');
@@ -2668,6 +2842,9 @@ module SuGptRender
     @tray.add_action_callback("set_live_render_multi") do |_, v|
       cfg = load_config; cfg["live_render_multi_view"] = (v.to_s == "1"); save_config(cfg)
     end
+    @tray.add_action_callback("refresh_live_render_materials") do |_, _|
+      push_live_render_materials
+    end
     @tray.add_action_callback("edit_live_render_prompt")  { |_, _| edit_live_render_prompt }
     @tray.add_action_callback("open_live_render_folder")  do |_, _|
       dir = history_dir
@@ -2701,6 +2878,18 @@ module SuGptRender
     @tray.add_action_callback("open_folder")     { |_, _| open_output_folder }
 
     @tray.show
+
+    # Live Render material panel: prime once on tray-open, then poll every 5s
+    # so user sees what materials Gemini will see when they switch component
+    # / change selection / edit materials. Cheap (just a tree-walk + JSON
+    # serialization, no HTTP). The timer survives load __FILE__ via @ivar.
+    push_live_render_materials
+    if @liverender_material_timer
+      UI.stop_timer(@liverender_material_timer) rescue nil
+    end
+    @liverender_material_timer = UI.start_timer(5.0, true) {
+      push_live_render_materials rescue nil
+    }
 
     # Background auto-update — schedule via UI.start_timer ON MAIN THREAD.
     # (Calling UI.start_timer FROM a background Thread is unreliable in SU;
@@ -2850,6 +3039,37 @@ module SuGptRender
          "#{(u = to_url.call(shaded_path)) ? u.to_json : 'null'}, " \
          "#{(u = to_url.call(render_path)) ? u.to_json : 'null'})"
     @tray.execute_script(js)
+  end
+
+  # Push the live material list to the tray panel. Used by:
+  #   - 5s polling tick (so dragging selection / opening containers reflects)
+  #   - Manual refresh button
+  #   - On Live Render Start
+  def self.push_live_render_materials
+    return unless @tray && @tray.visible?
+    model = (Sketchup.active_model rescue nil)
+    return unless model
+    _, label = live_render_material_scope(model)
+    materials = collect_used_materials(model)
+    rows = materials.first(30).map { |m|
+      next nil unless m
+      name = (m.respond_to?(:display_name) ? m.display_name : m.name).to_s
+      next nil if name.empty?
+      c = m.color rescue nil
+      hex = c ? format("#%02X%02X%02X", c.red, c.green, c.blue) : "(none)"
+      tex = (m.respond_to?(:texture) && m.texture) ? m.texture : nil
+      hint =
+        if tex
+          fn = (tex.filename rescue "") || ""
+          fn.empty? ? "textured" : "tex: #{File.basename(fn)}"
+        else
+          alpha = m.respond_to?(:alpha) ? (m.alpha rescue 1.0) : 1.0
+          alpha < 0.95 ? "translucent" : "solid"
+        end
+      [hex, name, hint]
+    }.compact
+    payload = { rows: rows, scope_label: label }
+    @tray.execute_script("renderLiveRenderMaterials(#{payload.to_json})")
   end
 
   def self.push_live_render_done(_entry)
