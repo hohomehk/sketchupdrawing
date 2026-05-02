@@ -53,3 +53,8 @@ out/ai_enhanced/
 # Build artifact emitted by sketchup_plugin/build-rbz.sh — has injected real
 # CF AIG token in plain text. Goes up as a GitHub release asset, not a commit.
 releases/su_gpt_render.rb
+
+# Build artifact emitted by build-rbz.sh — has injected real CF AIG token
+# inside the ruby source it bundles. Goes to local hohome-plugin-update.service
+# served at https://hohomehk-plugin.ngrok.app, NOT to GitHub.
+releases/su_gpt_render.rbz

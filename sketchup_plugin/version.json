@@ -1,5 +1,5 @@
 {
-  "version": "0.5.1",
-  "rb_url": "https://github.com/hohomehk/sketchupdrawing/releases/download/v0.5.1/su_gpt_render.rb",
-  "notes": "v0.5.1 — fix Live Render hang + add debug logging. Replaced the 0.05s first-tick UI.start_timer with a direct 0.5s timer (the 0.05s value sometimes never fired under SU 2025/2026's timer scheduler, leaving the user with status \"Live Render: ON\" and nothing else). Added [GPT Render Live] puts at every stage (start / kick / capture OK or fail / render OK or fail with stack-trace head) so users can pinpoint future hangs from Window → Ruby Console. No UI changes."
+  "version": "0.5.2",
+  "rb_url": "https://hohomehk-plugin.ngrok.app/su_gpt_render.rb",
+  "notes": "v0.5.2 — Auto-update endpoint migrated off public GitHub. UPDATE_MANIFEST_URL and rb_url now both point at https://hohomehk-plugin.ngrok.app (no auth, served from local box via ngrok). The shipped .rb continues to bundle the cf-aig-authorization token (BYOK requires it on the gateway side per CF docs), but because the .rb lives only behind a private tunnel, GitHub / CF leaked-token scanners never see it. We burned 3 tokens to public GitHub releases learning this; this design ends the revoke cycle. WP server keeps using AI Gateway directly (token there lives only in wp_options on the private deco2hk-srv host)."
 }

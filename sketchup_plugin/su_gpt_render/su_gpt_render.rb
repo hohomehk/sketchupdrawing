@@ -14,7 +14,7 @@ require 'thread'   # Queue used by Live Stream main↔bg thread handoff
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.5.1"
+  PLUGIN_VERSION = "0.5.2"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -112,7 +112,15 @@ module SuGptRender
   # Set this to a JSON URL to enable auto-update. The JSON should have:
   #   { "version": "0.3.0", "rb_url": "https://.../su_gpt_render.rb", "notes": "..." }
   # Leave nil to disable auto-update entirely.
-  UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/hohomehk/sketchupdrawing/main/sketchup_plugin/version.json"
+  #
+  # Hosted on a private ngrok tunnel (hohomehk-plugin.ngrok.app → local :8743)
+  # so the served su_gpt_render.rb — which has the cf-aig-authorization token
+  # baked in by build-rbz.sh — never lands on a public crawl path. We migrated
+  # off raw.githubusercontent.com because Cloudflare's leaked-token scanner
+  # auto-revoked every CF AIG token within minutes of a public release upload
+  # (3 tokens burned before pivoting). The tunnel URL is fine to leak; the .rb
+  # behind it has a real token but no automated scanner crawls ngrok endpoints.
+  UPDATE_MANIFEST_URL = "https://hohomehk-plugin.ngrok.app/version.json"
 
   DEFAULT_PROMPT = <<~PROMPT.strip
     Transform this 3D architectural rendering into a photorealistic interior photograph
