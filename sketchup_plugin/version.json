@@ -1,5 +1,5 @@
 {
-  "version": "0.5.4",
+  "version": "0.5.5",
   "rb_url": "https://hohomehk-plugin.ngrok.app/su_gpt_render.rb",
-  "notes": "v0.5.4 — CRITICAL pricing fix. LIVE_RENDER_OUTPUT_PRICE_PER_TOKEN was 0.40e-6 (the text-output rate); the actual image-output rate is $30/M tokens, so the meter was understating cost by 75×. Per Google docs (ai.google.dev/gemini-api/docs/pricing) gemini-2.5-flash-image is billed at $0.039 per 1024×1024 image (1290 tokens × $30/M); free tier does NOT cover image generation on any plan. New rate constant + updated comments. UI cost line will now show realistic figures (was ~$0.001/render, will now show ~$0.039 ≈ HK$0.31)."
+  "notes": "v0.5.5 — Live Render output is no longer locked to 1024×1024. New aspect-ratio dropdown (1:1, 16:9 widescreen, 9:16 portrait, 4:3, 3:4) plumbs through generationConfig.imageConfig.aspectRatio. All ratios cost the same $0.039/render (1290 image tokens regardless of shape). 16:9 = 1344×768 — better fit for typical SU widescreen viewports than the square default."
 }

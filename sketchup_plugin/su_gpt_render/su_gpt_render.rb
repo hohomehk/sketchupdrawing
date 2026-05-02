@@ -14,7 +14,7 @@ require 'thread'   # Queue used by Live Stream main↔bg thread handoff
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.5.4"
+  PLUGIN_VERSION = "0.5.5"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -449,7 +449,8 @@ module SuGptRender
   #   - maxOutputTokens=1024 caps the visible response. Live Stream feedback
   #     should be brief; the user can re-ask for more detail.
   def self.build_gemini_payload(image_path, prompt, model: "gemini-2.5-flash",
-                                mime_type: "image/jpeg", max_output_tokens: 1024)
+                                mime_type: "image/jpeg", max_output_tokens: 1024,
+                                aspect_ratio: nil)
     img_b64 = Base64.strict_encode64(File.binread(image_path))
     body = {
       "contents" => [{
@@ -461,10 +462,13 @@ module SuGptRender
     }
     # Image-output models (gemini-2.5-flash-image et al.) do NOT accept
     # thinkingConfig and need their full token budget (~1290 tokens per
-    # 1024² PNG). Skip both knobs entirely for them. For all other (text-out)
-    # models, cap maxOutputTokens and conditionally disable thinking.
+    # 1024² PNG). Skip both knobs entirely for them but DO accept
+    # imageConfig.aspectRatio (verified: 16:9 → 1344×768, 9:16 → 768×1344,
+    # 1:1 → 1024×1024 — all same cost, 1290 output tokens).
     if GEMINI_IMAGE_MODELS.include?(model)
-      # No generationConfig at all — let Gemini use its defaults.
+      if aspect_ratio && aspect_ratio != "1:1"
+        body["generationConfig"] = { "imageConfig" => { "aspectRatio" => aspect_ratio } }
+      end
     else
       body["generationConfig"] = { "maxOutputTokens" => max_output_tokens }
       if GEMINI_THINKING_DISABLABLE.include?(model)
@@ -513,10 +517,12 @@ module SuGptRender
   #   usageMetadata.candidatesTokensDetails[].tokenCount where modality=IMAGE
   def self.call_gemini_image(input_image_path, prompt,
                              model: "gemini-2.5-flash-image",
-                             input_mime: "image/png")
+                             input_mime: "image/png",
+                             aspect_ratio: nil)
     url = "#{GEMINI_AIG_URL}/v1beta/models/#{model}:generateContent"
     payload = build_gemini_payload(input_image_path, prompt,
-                                   model: model, mime_type: input_mime)
+                                   model: model, mime_type: input_mime,
+                                   aspect_ratio: aspect_ratio)
     res = http_post_json(url, gemini_aig_headers, JSON.generate(payload))
     unless res.is_a?(Net::HTTPSuccess)
       raise "Gemini Image AI Gateway HTTP #{res.code}: #{res.body[0,300]}"
@@ -1245,7 +1251,8 @@ module SuGptRender
     model  = cfg["live_render_model"]  || LIVE_RENDER_MODELS.first[0]
     width  = (cfg["live_render_width"]  || 1024).to_i
     height = (cfg["live_render_height"] || 1024).to_i
-    puts "[GPT Render Live] kick: capturing #{width}x#{height} model=#{model}"
+    aspect = cfg["live_render_aspect"] || "1:1"   # 1:1, 16:9, 9:16, 4:3, 3:4
+    puts "[GPT Render Live] kick: capturing #{width}x#{height} model=#{model} aspect=#{aspect}"
 
     raw_path = nil
     begin
@@ -1272,7 +1279,8 @@ module SuGptRender
         end
         render_path, tokens = call_gemini_image(raw_path, prompt,
                                                 model: model,
-                                                input_mime: "image/png")
+                                                input_mime: "image/png",
+                                                aspect_ratio: aspect)
         elapsed = (Time.now - started).round(1)
         puts "[GPT Render Live] render OK: #{render_path} (#{tokens} tokens, #{elapsed}s)"
         # Default: drop the raw SU view we just sent — only the AI render is
@@ -1496,6 +1504,7 @@ module SuGptRender
     liver_enabled   = @liverender && @liverender[:enabled] ? true : false
     liver_interval  = (cfg["live_render_interval"]   || 15).to_i
     liver_resolution = (cfg["live_render_width"]      || 1024).to_i
+    liver_aspect    = cfg["live_render_aspect"]      || "1:1"
     liver_keep_raw  = cfg["live_render_keep_raw"]    == true
     liver_model     = cfg["live_render_model"]       || LIVE_RENDER_MODELS.first[0]
     liver_today     = live_render_count_today
@@ -1802,11 +1811,22 @@ module SuGptRender
           <div class="grid row">
             <label>Capture resolution
               <select id="liver_resolution" onchange="setLiveRenderResolution()">
-                <option value="512"  #{liver_resolution == 512  ? 'selected' : ''}>512×512  (smallest, ~9s)</option>
-                <option value="768"  #{liver_resolution == 768  ? 'selected' : ''}>768×768  (~10s)</option>
-                <option value="1024" #{liver_resolution == 1024 ? 'selected' : ''}>1024×1024 (default, ~12s)</option>
+                <option value="512"  #{liver_resolution == 512  ? 'selected' : ''}>512×512  (smallest)</option>
+                <option value="768"  #{liver_resolution == 768  ? 'selected' : ''}>768×768</option>
+                <option value="1024" #{liver_resolution == 1024 ? 'selected' : ''}>1024×1024 (default)</option>
               </select>
             </label>
+            <label>Output aspect (same cost)
+              <select id="liver_aspect" onchange="setLiveRenderAspect()">
+                <option value="1:1"  #{liver_aspect == "1:1"  ? 'selected' : ''}>1:1   (1024×1024 square)</option>
+                <option value="16:9" #{liver_aspect == "16:9" ? 'selected' : ''}>16:9  (1344×768 widescreen)</option>
+                <option value="9:16" #{liver_aspect == "9:16" ? 'selected' : ''}>9:16  (768×1344 portrait)</option>
+                <option value="4:3"  #{liver_aspect == "4:3"  ? 'selected' : ''}>4:3   (1184×880 photo)</option>
+                <option value="3:4"  #{liver_aspect == "3:4"  ? 'selected' : ''}>3:4   (880×1184 vertical)</option>
+              </select>
+            </label>
+          </div>
+          <div class="grid row">
             <label>Keep raw captures
               <select id="liver_keep_raw" onchange="setLiveRenderKeepRaw()">
                 <option value="0" #{!liver_keep_raw ? 'selected' : ''}>No (auto-delete after render)</option>
@@ -1989,6 +2009,7 @@ module SuGptRender
         function setLiveRenderInterval()  { sketchup.set_live_render_interval(document.getElementById('liver_interval').value); }
         function setLiveRenderModel()     { sketchup.set_live_render_model(document.getElementById('liver_model').value); }
         function setLiveRenderResolution(){ sketchup.set_live_render_resolution(document.getElementById('liver_resolution').value); }
+        function setLiveRenderAspect()    { sketchup.set_live_render_aspect(document.getElementById('liver_aspect').value); }
         function setLiveRenderKeepRaw()   { sketchup.set_live_render_keep_raw(document.getElementById('liver_keep_raw').value); }
         function setLiveRenderUI(enabled) {
           const btn  = document.getElementById('liver_btn');
@@ -2409,6 +2430,12 @@ module SuGptRender
       r = v.to_i.clamp(256, 2048)
       cfg = load_config; cfg["live_render_width"] = r; cfg["live_render_height"] = r; save_config(cfg)
     end
+    @tray.add_action_callback("set_live_render_aspect") do |_, v|
+      allowed = %w[1:1 16:9 9:16 4:3 3:4]
+      cfg = load_config
+      cfg["live_render_aspect"] = allowed.include?(v.to_s) ? v.to_s : "1:1"
+      save_config(cfg)
+    end
     @tray.add_action_callback("set_live_render_keep_raw") do |_, v|
       cfg = load_config; cfg["live_render_keep_raw"] = (v.to_s == "1"); save_config(cfg)
     end
@@ -2599,6 +2626,7 @@ module SuGptRender
   # newest left → right is reversed since we unshift onto the head).
   def self.render_live_render_history_html
     items = (@liverender && @liverender[:history]) || []
+    items = items.select { |it| it.is_a?(Hash) }   # defensive: ignore stale ivar pollution
     return "<div style='opacity:.5;font-size:11px;padding:14px;'>No renders yet — Start Live Render and watch them stream in.</div>" if items.empty?
     items.map { |it|
       raw_url    = it[:raw_path]    ? "file://" + it[:raw_path].gsub("\\", "/")    : ""
