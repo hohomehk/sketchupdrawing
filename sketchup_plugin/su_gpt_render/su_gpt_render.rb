@@ -14,7 +14,7 @@ require 'thread'   # Queue used by Live Stream main↔bg thread handoff
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.5.3"
+  PLUGIN_VERSION = "0.5.4"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -1104,7 +1104,13 @@ module SuGptRender
   # 1024² PNG returns ~1290 tokens → ~$0.000516. We compute the meter from
   # the actual recorded tokens (summed across today's renders) so it stays
   # honest as the model evolves.
-  LIVE_RENDER_OUTPUT_PRICE_PER_TOKEN = 0.40e-6
+  # IMPORTANT: gemini-2.5-flash-image is billed at $30/M output tokens
+  # (Google's official rate, see https://ai.google.dev/gemini-api/docs/pricing).
+  # That's 75× the text-output rate ($0.40/M) — earlier versions used the
+  # text rate by mistake and showed costs 75× too low. 1290 tokens × $30/M
+  # = $0.0387 ≈ $0.039 / image, which matches Google's flat per-image quote.
+  # NOTE: image generation has NO free tier, even on the lowest paid plan.
+  LIVE_RENDER_OUTPUT_PRICE_PER_TOKEN = 30.0e-6
 
   # Capture the current view as a PNG sized for image-input. We send PNG (not
   # JPEG) because gemini-2.5-flash-image happily accepts both and PNG keeps

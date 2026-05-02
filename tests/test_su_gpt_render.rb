@@ -1064,7 +1064,7 @@ end
 
 class TestVersionBump < Minitest::Test
   # Single source of truth — bump when releasing.
-  EXPECTED_VERSION = "0.5.3"
+  EXPECTED_VERSION = "0.5.4"
 
   def test_plugin_version_matches_expected
     assert_equal EXPECTED_VERSION, SuGptRender::PLUGIN_VERSION
@@ -1399,19 +1399,28 @@ class TestLiveRenderCost < Minitest::Test
   end
 
   def test_cost_today_for_known_token_count
-    # 1290 image-output tokens × $0.40/M = $0.000516 → rounded to 4 d.p.
+    # 1290 image-output tokens × $30/M = $0.0387 ≈ Google's $0.039 per image.
+    # gemini-2.5-flash-image's actual rate; image gen has no free tier.
     SuGptRender.bump_live_render_count(1290)
     cost = SuGptRender.live_render_cost_today
-    # Round(0.000516, 4) = 0.0005
-    assert_in_delta 0.0005, cost, 0.0001,
-      "1290 tokens at $0.40/M ≈ $0.0005, got #{cost}"
+    assert_in_delta 0.0387, cost, 0.001,
+      "1290 tokens at $30/M ≈ $0.039 / image, got #{cost}"
   end
 
   def test_cost_today_scales_with_tokens
-    # 20 renders × 1290 tokens = 25800 tokens × 0.40e-6 = 0.01032 → 0.0103
+    # 20 renders × 1290 tokens = 25800 tokens × 30e-6 = $0.774
     20.times { SuGptRender.bump_live_render_count(1290) }
     cost = SuGptRender.live_render_cost_today
-    assert_in_delta 0.0103, cost, 0.001
+    assert_in_delta 0.774, cost, 0.01,
+      "20 renders at $0.0387/each ≈ $0.774, got #{cost}"
+  end
+
+  def test_cost_today_in_hkd
+    # 1290 tokens × $30/M × 7.85 ≈ HK$0.304
+    SuGptRender.bump_live_render_count(1290)
+    cost_hkd = SuGptRender.live_render_cost_today_hkd
+    assert_in_delta 0.304, cost_hkd, 0.01,
+      "1290 tokens ≈ HK$0.30, got HK$#{cost_hkd}"
   end
 end
 

@@ -1,5 +1,5 @@
 {
-  "version": "0.5.3",
+  "version": "0.5.4",
   "rb_url": "https://hohomehk-plugin.ngrok.app/su_gpt_render.rb",
-  "notes": "v0.5.3 — three quality-of-life fixes for Live Render. (1) with_flat_lighting helper temporarily disables UseSunForShading + DisplayShadows during every capture (live_render, live_stream, ai_watch) so a pure-white SU wall doesn't read as light-grey to Gemini and get re-rendered as a grey wall. Restore on exit even if write_image raises. (2) Auto-delete the raw SU view after Gemini returns (set live_render_keep_raw=true to keep both). Solves folder-clutter complaint — the AI render is what you want to keep, not the input. (3) Capture resolution dropdown (512/768/1024) and sane interval default 15s instead of 10s (rendering takes ~12s; smaller intervals just spam in_flight=true ticks). Cost meter now shows HKD too (US$x.xxxx + HK$y.yyy at 7.85 peg)."
+  "notes": "v0.5.4 — CRITICAL pricing fix. LIVE_RENDER_OUTPUT_PRICE_PER_TOKEN was 0.40e-6 (the text-output rate); the actual image-output rate is $30/M tokens, so the meter was understating cost by 75×. Per Google docs (ai.google.dev/gemini-api/docs/pricing) gemini-2.5-flash-image is billed at $0.039 per 1024×1024 image (1290 tokens × $30/M); free tier does NOT cover image generation on any plan. New rate constant + updated comments. UI cost line will now show realistic figures (was ~$0.001/render, will now show ~$0.039 ≈ HK$0.31)."
 }
