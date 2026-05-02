@@ -49,3 +49,7 @@ out/ai_enhanced/
 
 # Local job runner state
 *.log
+
+# Build artifact emitted by sketchup_plugin/build-rbz.sh — has injected real
+# CF AIG token in plain text. Goes up as a GitHub release asset, not a commit.
+releases/su_gpt_render.rb

@@ -14,7 +14,7 @@ require 'thread'   # Queue used by Live Stream main↔bg thread handoff
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.4.4"
+  PLUGIN_VERSION = "0.5.0"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -50,6 +50,14 @@ module SuGptRender
   GEMINI_THINKING_DISABLABLE = %w[
     gemini-2.5-flash
     gemini-3.1-flash-lite-preview
+  ].freeze
+
+  # Image-output Gemini models. These do NOT accept thinkingConfig at all,
+  # and they need their full token budget (~1290 tokens for one 1024² PNG)
+  # so we also skip the maxOutputTokens cap for them. Used by the Live
+  # Render tab.
+  GEMINI_IMAGE_MODELS = %w[
+    gemini-2.5-flash-image
   ].freeze
 
   # Vision models for AI Watch (text+image → text). First entry = default.
@@ -442,12 +450,18 @@ module SuGptRender
           { "text" => prompt },
         ]
       }],
-      "generationConfig" => {
-        "maxOutputTokens" => max_output_tokens,
-      },
     }
-    if GEMINI_THINKING_DISABLABLE.include?(model)
-      body["generationConfig"]["thinkingConfig"] = { "thinkingBudget" => 0 }
+    # Image-output models (gemini-2.5-flash-image et al.) do NOT accept
+    # thinkingConfig and need their full token budget (~1290 tokens per
+    # 1024² PNG). Skip both knobs entirely for them. For all other (text-out)
+    # models, cap maxOutputTokens and conditionally disable thinking.
+    if GEMINI_IMAGE_MODELS.include?(model)
+      # No generationConfig at all — let Gemini use its defaults.
+    else
+      body["generationConfig"] = { "maxOutputTokens" => max_output_tokens }
+      if GEMINI_THINKING_DISABLABLE.include?(model)
+        body["generationConfig"]["thinkingConfig"] = { "thinkingBudget" => 0 }
+      end
     end
     body
   end
@@ -475,6 +489,57 @@ module SuGptRender
     data = JSON.parse(res.body) rescue {}
     parts = data.dig("candidates", 0, "content", "parts") || []
     parts.map { |p| p["text"].to_s }.join.strip
+  end
+
+  # Image-output Gemini call (gemini-2.5-flash-image et al.). Returns
+  # `[output_path, candidate_image_tokens]`. The output PNG is written next
+  # to `input_image_path` with a `_render.png` suffix (or to a temp dir if
+  # the input is itself temp). Used by the Live Render tab.
+  #
+  # Body shape — same skeleton as build_gemini_payload but for image-out
+  # the model rejects thinkingConfig and maxOutputTokens (we already skip
+  # both via GEMINI_IMAGE_MODELS guard in build_gemini_payload).
+  #
+  # Response shape:
+  #   candidates[0].content.parts[*].inlineData.data → base64 PNG output
+  #   usageMetadata.candidatesTokensDetails[].tokenCount where modality=IMAGE
+  def self.call_gemini_image(input_image_path, prompt,
+                             model: "gemini-2.5-flash-image",
+                             input_mime: "image/png")
+    url = "#{GEMINI_AIG_URL}/v1beta/models/#{model}:generateContent"
+    payload = build_gemini_payload(input_image_path, prompt,
+                                   model: model, mime_type: input_mime)
+    res = http_post_json(url, gemini_aig_headers, JSON.generate(payload))
+    unless res.is_a?(Net::HTTPSuccess)
+      raise "Gemini Image AI Gateway HTTP #{res.code}: #{res.body[0,300]}"
+    end
+    data = JSON.parse(res.body) rescue {}
+    parts = data.dig("candidates", 0, "content", "parts") || []
+    img_part = parts.find { |p| p["inlineData"] && p["inlineData"]["data"] }
+    raise "No inlineData image in Gemini response: #{res.body[0,300]}" unless img_part
+
+    b64 = img_part["inlineData"]["data"].to_s
+    out_bytes = Base64.decode64(b64)
+
+    # Choose an output path next to the input (e.g. live_render dir),
+    # falling back to ~/Desktop if input has no usable directory.
+    in_dir = File.dirname(input_image_path)
+    base = File.basename(input_image_path, ".*")
+    out_path = File.join(in_dir, "#{base}_render.png")
+    File.binwrite(out_path, out_bytes)
+
+    # Token accounting: pull the IMAGE-modality candidate token count for
+    # the cost meter. Older Gemini responses include candidatesTokenCount
+    # at usageMetadata top level; newer ones break it down by modality.
+    tokens = 0
+    usage = data["usageMetadata"] || {}
+    if (details = usage["candidatesTokensDetails"])
+      img_detail = details.find { |d| d["modality"].to_s.upcase == "IMAGE" }
+      tokens = (img_detail && img_detail["tokenCount"]).to_i if img_detail
+    end
+    tokens = usage["candidatesTokenCount"].to_i if tokens.zero? && usage["candidatesTokenCount"]
+
+    [out_path, tokens]
   end
 
   # Pure-Ruby SSE chunk parser. Feeds incoming HTTP body bytes (which may
@@ -1002,6 +1067,245 @@ module SuGptRender
     (n * rate).round(4)
   end
 
+  # ----- Live Render ---------------------------------------------------------
+  # Captures the current view → calls Gemini 2.5 Flash Image (via AI Gateway)
+  # → writes the rendered PNG to disk → pushes input + output thumbnails to
+  # the tray. Each call takes ~10s and costs ~$0.0005 (1290 image tokens at
+  # $0.40/M output), so we keep a low cadence (5-30s) and never block the UI
+  # thread — same Queue pattern as Live Stream.
+
+  DEFAULT_LIVE_RENDER_PROMPT = <<~P.strip
+    Render this SketchUp scene as a photorealistic interior design rendering,
+    soft natural light, professional 3d visualization. Preserve the geometry
+    and proportions exactly. Do not add furniture, plants, or human figures
+    that aren't already present in the scene.
+  P
+
+  # Image-output models for the Live Render dropdown. First entry = default.
+  # Easy to extend later (gemini-3-pro-image-preview, etc.) without touching
+  # the call code — call_gemini_image just passes `model:` through.
+  LIVE_RENDER_MODELS = [
+    ["gemini-2.5-flash-image", "Gemini 2.5 Flash Image", "Google · ~10s · ~$0.0005/render"],
+  ].freeze
+
+  # Per-call cost = (image-output tokens) × ($0.40 / 1e6). Empirical: a single
+  # 1024² PNG returns ~1290 tokens → ~$0.000516. We compute the meter from
+  # the actual recorded tokens (summed across today's renders) so it stays
+  # honest as the model evolves.
+  LIVE_RENDER_OUTPUT_PRICE_PER_TOKEN = 0.40e-6
+
+  # Capture the current view as a PNG sized for image-input. We send PNG (not
+  # JPEG) because gemini-2.5-flash-image happily accepts both and PNG keeps
+  # SketchUp lines crisp (the ~3MB cost of an extra-quality input is fine
+  # given the model latency dominates).
+  def self.export_view_for_live_render(width, height)
+    model = Sketchup.active_model
+    raise "No model" unless model
+    base = model.path.empty? ? "Untitled" : File.basename(model.path, ".skp")
+    base = base.gsub(/[^\w一-鿿\-]/, "_")
+    timestamp = Time.now.strftime("%Y%m%d_%H%M%S_%L")
+    out_dir = if model.path.empty?
+                File.expand_path("~/Desktop/gpt_render/live_render")
+              else
+                File.join(File.dirname(model.path), "gpt_render", "live_render")
+              end
+    FileUtils.mkdir_p(out_dir)
+    out_path = File.join(out_dir, "#{timestamp}_#{base}_lr_raw.png")
+    success = model.active_view.write_image(filename: out_path, width: width,
+                                            height: height, antialias: true,
+                                            transparent: false)
+    raise "write_image failed" unless success
+    out_path
+  end
+
+  def self.start_live_render
+    return if @liverender[:enabled]
+    @liverender[:enabled]    = true
+    @liverender[:stop_flag]  = false
+    @liverender[:queue]      = Queue.new
+    @liverender[:in_flight]  = false
+    cfg = load_config
+    interval = (cfg["live_render_interval"] || 10).to_i.clamp(5, 600)
+
+    push_live_render_state(true)
+    push_live_render_status("Live Render: ON (#{interval}s)", "ok")
+
+    # Drain queue from main thread.
+    @liverender[:poll_timer] = UI.start_timer(0.2, true) { drain_live_render_queue }
+
+    # Tick: kick the first frame ~immediately, then every `interval` seconds.
+    @liverender[:tick_timer] = UI.start_timer(0.05, true) do
+      if !@liverender[:in_flight] && @liverender[:enabled]
+        kick_live_render_frame
+        UI.stop_timer(@liverender[:tick_timer]) if @liverender[:tick_timer]
+        @liverender[:tick_timer] = UI.start_timer(interval, true) do
+          kick_live_render_frame if !@liverender[:in_flight] && @liverender[:enabled]
+        end
+      end
+    end
+    puts "[GPT Render] Live Render started"
+  end
+
+  def self.stop_live_render
+    return unless @liverender[:enabled]
+    @liverender[:enabled]   = false
+    @liverender[:stop_flag] = true
+    if @liverender[:tick_timer]
+      UI.stop_timer(@liverender[:tick_timer]); @liverender[:tick_timer] = nil
+    end
+    if @liverender[:poll_timer]
+      UI.stop_timer(@liverender[:poll_timer]); @liverender[:poll_timer] = nil
+    end
+    @liverender[:bg_thread] = nil
+    @liverender[:queue]     = nil
+    @liverender[:in_flight] = false
+    push_live_render_state(false)
+    push_live_render_status("Live Render: OFF", "ok")
+    puts "[GPT Render] Live Render stopped"
+  end
+
+  def self.toggle_live_render
+    @liverender[:enabled] ? stop_live_render : start_live_render
+  end
+
+  def self.kick_live_render_frame
+    return unless @liverender[:enabled]
+    return if @liverender[:in_flight]
+    cfg = load_config
+    prompt = cfg["live_render_prompt"] || DEFAULT_LIVE_RENDER_PROMPT
+    model  = cfg["live_render_model"]  || LIVE_RENDER_MODELS.first[0]
+    width  = (cfg["live_render_width"]  || 1024).to_i
+    height = (cfg["live_render_height"] || 1024).to_i
+
+    raw_path = nil
+    begin
+      raw_path = export_view_for_live_render(width, height)
+    rescue => e
+      push_live_render_status("Capture failed: #{e.message}", "err")
+      return
+    end
+    push_live_render_frame(raw_path, nil)
+    @liverender[:in_flight] = true
+    push_live_render_status("Rendering (#{model}) ~10s…", "busy")
+
+    @liverender[:bg_thread] = Thread.new do
+      q = @liverender[:queue]
+      started = Time.now
+      begin
+        # Bail before we even hit the wire if user already pressed Stop.
+        if @liverender[:stop_flag]
+          q << [:flight_done, nil] if q
+          next
+        end
+        render_path, tokens = call_gemini_image(raw_path, prompt,
+                                                model: model,
+                                                input_mime: "image/png")
+        elapsed = (Time.now - started).round(1)
+        # Drop the result if user hit Stop while we were rendering — don't
+        # push stale frames into a paused tab.
+        if @liverender[:stop_flag]
+          q << [:flight_done, nil] if q
+          next
+        end
+        q << [:render, {
+          raw_path:    raw_path,
+          render_path: render_path,
+          prompt:      prompt,
+          model:       model,
+          tokens:      tokens,
+          elapsed:     elapsed,
+          ts:          Time.now.iso8601,
+        }] if q
+      rescue => e
+        q << [:err, e.message] if q
+      ensure
+        q << [:flight_done, nil] if q
+      end
+    end
+  end
+
+  # Drain queue. Runs on main UI thread via UI.start_timer.
+  def self.drain_live_render_queue
+    q = @liverender[:queue]
+    return unless q
+    until q.empty?
+      kind, payload = q.pop(true) rescue break
+      case kind
+      when :render
+        record_live_render(payload)
+        push_live_render_frame(payload[:raw_path], payload[:render_path])
+        push_live_render_done(payload)
+        push_live_render_status(
+          "Rendered in #{payload[:elapsed]}s · #{payload[:tokens]} img tokens", "ok"
+        )
+      when :err
+        push_live_render_status("Render error: #{payload.to_s[0,140]}", "err")
+      when :flight_done
+        @liverender[:in_flight] = false
+      end
+    end
+  end
+
+  # Persist a render to history (in-memory ring + JSONL on disk for audit).
+  def self.record_live_render(entry)
+    @liverender[:current_render] = entry
+    @liverender[:history] ||= []
+    @liverender[:history].unshift(entry)
+    if @liverender[:history].length > (@liverender[:history_max] || 8)
+      @liverender[:history] = @liverender[:history].first(@liverender[:history_max])
+    end
+    log_live_render(entry)
+    bump_live_render_count(entry[:tokens] || 0)
+  end
+
+  def self.log_live_render(entry)
+    dir = history_dir
+    return unless dir
+    out_dir = File.join(dir, "live_render")
+    FileUtils.mkdir_p(out_dir)
+    log_path = File.join(out_dir, "live_render_#{Time.now.strftime('%Y%m%d')}.jsonl")
+    File.open(log_path, "a") { |f|
+      f.puts JSON.generate({
+        "ts"       => entry[:ts],
+        "model"    => entry[:model],
+        "tokens"   => entry[:tokens],
+        "elapsed"  => entry[:elapsed],
+        "raw"      => File.basename(entry[:raw_path].to_s),
+        "render"   => File.basename(entry[:render_path].to_s),
+        "prompt"   => entry[:prompt],
+      })
+    }
+  end
+
+  def self.bump_live_render_count(tokens = 0)
+    cfg = load_config
+    today = Time.now.strftime("%Y-%m-%d")
+    cfg["live_render_counts"] ||= {}
+    cfg["live_render_counts"][today] = (cfg["live_render_counts"][today] || 0) + 1
+    cfg["live_render_tokens"] ||= {}
+    cfg["live_render_tokens"][today] = (cfg["live_render_tokens"][today] || 0) + tokens.to_i
+    save_config(cfg)
+  end
+
+  def self.live_render_count_today
+    cfg = load_config
+    today = Time.now.strftime("%Y-%m-%d")
+    (cfg["live_render_counts"] || {})[today] || 0
+  end
+
+  def self.live_render_tokens_today
+    cfg = load_config
+    today = Time.now.strftime("%Y-%m-%d")
+    (cfg["live_render_tokens"] || {})[today] || 0
+  end
+
+  # Cost = today's image-output tokens × per-token price. Rounded to 4 d.p.
+  # so 1¢ thresholds show on the meter (a single render is ~$0.0005).
+  def self.live_render_cost_today
+    tokens = live_render_tokens_today
+    (tokens * LIVE_RENDER_OUTPUT_PRICE_PER_TOKEN).round(4)
+  end
+
   # ------ tray dialog --------------------------------------------------------
   # Use ||= so that `load __FILE__` (hot-reload) preserves these references.
   # If we used = the load would reset @tray to nil and we'd lose the live dialog.
@@ -1039,6 +1343,31 @@ module SuGptRender
     current_text:  "",
     in_flight:     false,
   }
+  # Live Render state — separate tab, ~10s per render, captures view → calls
+  # gemini-2.5-flash-image → renders the result image side-by-side with the
+  # input frame. Same Queue + bg_thread + poll_timer pattern as Live Stream
+  # because each call blocks ~10s and we MUST not block the SU UI thread.
+  #   :enabled        — true while the loop is running
+  #   :stop_flag      — set true to abort an in-flight call cooperatively
+  #   :in_flight      — true while a render call is mid-flight
+  #   :history        — Array of {ts:, raw_path:, render_path:, prompt:, tokens:}
+  #   :history_max    — keep last N (oldest evicted)
+  #   :current_render — most recent {raw_path, render_path, tokens, ...}
+  #   :poll_timer     — UI timer that drains :queue onto the tray
+  #   :tick_timer     — recurring frame trigger between calls
+  #   :queue          — Thread::Queue of [:render|:err|:flight_done, payload]
+  @liverender            ||= {
+    enabled:        false,
+    in_flight:      false,
+    stop_flag:      false,
+    history:        [],
+    history_max:    8,
+    current_render: nil,
+    poll_timer:     nil,
+    tick_timer:     nil,
+    bg_thread:      nil,
+    queue:          nil,
+  }
 
   def self.tray_html
     cfg = load_config
@@ -1068,6 +1397,18 @@ module SuGptRender
     live_quality  = (cfg["live_quality"]  || 60).to_i
     live_today    = live_count_today
     live_cost     = live_cost_today
+
+    # Live Render state for HTML
+    liver_enabled   = @liverender && @liverender[:enabled] ? true : false
+    liver_interval  = (cfg["live_render_interval"] || 10).to_i
+    liver_model     = cfg["live_render_model"] || LIVE_RENDER_MODELS.first[0]
+    liver_today     = live_render_count_today
+    liver_cost      = live_render_cost_today
+    liver_history_html = render_live_render_history_html
+    liver_model_options = LIVE_RENDER_MODELS.map { |id, label, hint|
+      sel = (id == liver_model) ? " selected" : ""
+      "<option value=\"#{id}\"#{sel}>#{CGI.escapeHTML(label)} — #{CGI.escapeHTML(hint)}</option>"
+    }.join("\n")
 
     model_options_html = IMAGE_MODELS.map { |id, label, hint|
       sel = (id == selected_model) ? " selected" : ""
@@ -1184,6 +1525,7 @@ module SuGptRender
           <button id="mt_history" onclick="switchMainTab('history')">History <span class="badge" id="hist_count">#{history_count}</span></button>
           <button id="mt_aiwatch" onclick="switchMainTab('aiwatch')">AI Watch <span class="badge" id="aiw_dot">#{aiw_enabled ? '●' : ''}</span></button>
           <button id="mt_live"    onclick="switchMainTab('live')">Live Stream <span class="badge" id="live_dot">#{live_enabled ? '●' : ''}</span></button>
+          <button id="mt_liver"   onclick="switchMainTab('liver')">🎨 Live Render <span class="badge" id="liver_dot">#{liver_enabled ? '●' : ''}</span></button>
         </div>
 
         <!-- ========== Render tab ========== -->
@@ -1335,6 +1677,58 @@ module SuGptRender
           <div id="live_output" style="background:#0a0a0a;border:1px solid #2a2a2a;border-radius:4px;padding:10px;min-height:80px;max-height:280px;overflow-y:auto;font-size:12.5px;line-height:1.5;white-space:pre-wrap;color:#cfc;"></div>
         </div>
 
+        <!-- ========== Live Render tab ========== -->
+        <div id="liver_pane" class="pane">
+          <div id="liver_status_pill" class="aiw-status #{liver_enabled ? 'on' : 'off'}">
+            #{liver_enabled ? '● Rendering' : '○ Off'}
+          </div>
+          <div class="row">
+            <button id="liver_btn" class="primary" style="width:100%" onclick="toggleLiveRender()">
+              #{liver_enabled ? '■ Stop Live Render' : '▶ Start Live Render'}
+            </button>
+          </div>
+
+          <div class="grid row">
+            <label>Image model
+              <select id="liver_model" onchange="setLiveRenderModel()">#{liver_model_options}</select>
+            </label>
+            <label>Render interval
+              <select id="liver_interval" onchange="setLiveRenderInterval()">
+                <option value="5"  #{liver_interval == 5  ? 'selected' : ''}>5s</option>
+                <option value="10" #{liver_interval == 10 ? 'selected' : ''}>10s</option>
+                <option value="20" #{liver_interval == 20 ? 'selected' : ''}>20s</option>
+                <option value="30" #{liver_interval == 30 ? 'selected' : ''}>30s</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="small-btns">
+            <button class="small" onclick="cmd('edit_live_render_prompt')">Render Prompt</button>
+            <button class="small" onclick="cmd('open_live_render_folder')">Open folder</button>
+          </div>
+
+          <div class="info-grid">
+            <div>Today</div><div id="liver_today">#{liver_today} renders · ~$#{format('%.4f', liver_cost)}</div>
+            <div>Capture</div><div>PNG · 1024×1024 (image-input)</div>
+            <div>Endpoint</div><div><code>gemini-2.5-flash-image · generateContent</code></div>
+          </div>
+
+          <h3>Captured frame &nbsp;→&nbsp; AI Render</h3>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+            <div class="preview" style="min-height:120px">
+              <div id="liver_frame_in_empty" class="empty">Captured SU view appears here</div>
+              <img id="liver_frame_in" style="display:none" onclick="liverOpen('in')">
+            </div>
+            <div class="preview" style="min-height:120px">
+              <div id="liver_frame_out_empty" class="empty">AI render appears here ~10s after capture</div>
+              <img id="liver_frame_out" style="display:none" onclick="liverOpen('out')">
+            </div>
+          </div>
+
+          <h3>Recent renders</h3>
+          <div id="liver_history" style="display:flex;gap:6px;overflow-x:auto;padding:4px 0 8px;min-height:90px;">#{liver_history_html}</div>
+        </div>
+
         <!-- ========== History tab ========== -->
         <div id="history_pane" class="pane">
           <div class="small-btns">
@@ -1402,7 +1796,7 @@ module SuGptRender
           }
         }
         function switchMainTab(name) {
-          ['render','prompts','history','aiwatch','live'].forEach(n => {
+          ['render','prompts','history','aiwatch','live','liver'].forEach(n => {
             const tabBtn = document.getElementById('mt_' + n);
             const pane = document.getElementById(n + '_pane');
             if (tabBtn) tabBtn.classList.toggle('active', name === n);
@@ -1475,6 +1869,51 @@ module SuGptRender
           appendLiveToken('', fullText);
           const t = document.getElementById('live_today');
           if (t) t.textContent = todayCount + ' streams · ~$' + todayCost;
+        }
+        // Live Render
+        let liverInUrl = null, liverOutUrl = null;
+        function toggleLiveRender()       { sketchup.toggle_live_render(''); }
+        function setLiveRenderInterval()  { sketchup.set_live_render_interval(document.getElementById('liver_interval').value); }
+        function setLiveRenderModel()     { sketchup.set_live_render_model(document.getElementById('liver_model').value); }
+        function setLiveRenderUI(enabled) {
+          const btn  = document.getElementById('liver_btn');
+          const dot  = document.getElementById('liver_dot');
+          const pill = document.getElementById('liver_status_pill');
+          if (btn)  btn.textContent  = enabled ? '■ Stop Live Render' : '▶ Start Live Render';
+          if (dot)  dot.textContent  = enabled ? '●' : '';
+          if (pill) {
+            pill.textContent = enabled ? '● Rendering' : '○ Off';
+            pill.className   = 'aiw-status ' + (enabled ? 'on' : 'off');
+          }
+        }
+        function setLiveRenderFrames(rawUrl, renderUrl) {
+          if (rawUrl) {
+            liverInUrl = rawUrl;
+            const i = document.getElementById('liver_frame_in');
+            const e = document.getElementById('liver_frame_in_empty');
+            if (i) { i.src = rawUrl + '?_=' + Date.now(); i.style.display = 'block'; }
+            if (e) e.style.display = 'none';
+          }
+          if (renderUrl) {
+            liverOutUrl = renderUrl;
+            const i = document.getElementById('liver_frame_out');
+            const e = document.getElementById('liver_frame_out_empty');
+            if (i) { i.src = renderUrl + '?_=' + Date.now(); i.style.display = 'block'; }
+            if (e) e.style.display = 'none';
+          }
+        }
+        function liverOpen(side) {
+          const url = side === 'in' ? liverInUrl : liverOutUrl;
+          if (url) sketchup.open_url(url);
+        }
+        function setLiveRenderHistory(html) {
+          const h = document.getElementById('liver_history');
+          if (h) h.innerHTML = html;
+        }
+        function liveRenderDone(historyHtml, todayCount, todayCost) {
+          setLiveRenderHistory(historyHtml);
+          const t = document.getElementById('liver_today');
+          if (t) t.textContent = todayCount + ' renders · ~$' + todayCost;
         }
         function toggleWatch() { sketchup.toggle_watch(''); }
         function setWatchDelay() { sketchup.set_watch_delay(document.getElementById('aiw_delay').value); }
@@ -1842,6 +2281,27 @@ module SuGptRender
       end
     end
 
+    # Live Render callbacks
+    @tray.add_action_callback("toggle_live_render")       { |_, _| toggle_live_render }
+    @tray.add_action_callback("set_live_render_interval") do |_, v|
+      cfg = load_config; cfg["live_render_interval"] = v.to_i; save_config(cfg)
+    end
+    @tray.add_action_callback("set_live_render_model")    do |_, v|
+      cfg = load_config; cfg["live_render_model"] = v.to_s; save_config(cfg)
+    end
+    @tray.add_action_callback("edit_live_render_prompt")  { |_, _| edit_live_render_prompt }
+    @tray.add_action_callback("open_live_render_folder")  do |_, _|
+      dir = history_dir
+      if dir
+        lr_dir = File.join(dir, "live_render")
+        FileUtils.mkdir_p(lr_dir)
+        UI.openURL("file://" + lr_dir.gsub("\\", "/"))
+      end
+    end
+    @tray.add_action_callback("open_url") do |_, url|
+      UI.openURL(url.to_s) unless url.to_s.empty?
+    end
+
     @tray.add_action_callback("save_recent_as_template") do |_, idx|
       r = recent_prompts[idx.to_i]
       next unless r
@@ -1985,6 +2445,54 @@ module SuGptRender
     )
   end
 
+  # ---- Live Render tray-push helpers ----------------------------------------
+  def self.push_live_render_state(enabled)
+    return unless @tray && @tray.visible?
+    @tray.execute_script("setLiveRenderUI(#{enabled ? 'true' : 'false'})")
+  end
+
+  def self.push_live_render_status(msg, cls = "")
+    push_status(msg, cls)
+  end
+
+  def self.push_live_render_frame(raw_path, render_path)
+    return unless @tray && @tray.visible?
+    raw_url    = raw_path    ? "file://" + raw_path.gsub("\\", "/")    : nil
+    render_url = render_path ? "file://" + render_path.gsub("\\", "/") : nil
+    @tray.execute_script(
+      "setLiveRenderFrames(#{raw_url ? raw_url.to_json : 'null'}, #{render_url ? render_url.to_json : 'null'})"
+    )
+  end
+
+  def self.push_live_render_done(_entry)
+    return unless @tray && @tray.visible?
+    html = render_live_render_history_html
+    @tray.execute_script(
+      "liveRenderDone(#{html.to_json}, #{live_render_count_today}, '#{format('%.4f', live_render_cost_today)}')"
+    )
+  end
+
+  # Render the horizontal-scroll history strip (last N renders, oldest →
+  # newest left → right is reversed since we unshift onto the head).
+  def self.render_live_render_history_html
+    items = (@liverender && @liverender[:history]) || []
+    return "<div style='opacity:.5;font-size:11px;padding:14px;'>No renders yet — Start Live Render and watch them stream in.</div>" if items.empty?
+    items.map { |it|
+      raw_url    = it[:raw_path]    ? "file://" + it[:raw_path].gsub("\\", "/")    : ""
+      render_url = it[:render_path] ? "file://" + it[:render_path].gsub("\\", "/") : ""
+      ts = it[:ts].to_s
+      tlabel = ts.length >= 16 ? ts[11,8] : ts
+      tokens = it[:tokens].to_i
+      tooltip = "#{tlabel} · #{tokens} tokens · #{it[:elapsed]}s"
+      <<~HTML
+        <div style="flex:0 0 auto;display:flex;flex-direction:column;align-items:center;gap:4px;background:#222;padding:6px;border-radius:4px;">
+          <img src="#{render_url}" style="width:96px;height:96px;object-fit:cover;border-radius:3px;cursor:pointer;" onclick="sketchup.open_url(#{render_url.to_json})" title="#{CGI.escapeHTML(tooltip)}">
+          <div style="font-size:10px;opacity:.6;">#{tlabel}</div>
+        </div>
+      HTML
+    }.join("\n")
+  end
+
   # Edit the watch prompt in a multiline HtmlDialog (similar to render prompt)
   def self.edit_watch_prompt
     cfg = load_config
@@ -2072,6 +2580,57 @@ module SuGptRender
       cfg2 = load_config; cfg2["live_prompt"] = decoded; save_config(cfg2)
       dlg.close
       UI.messagebox("Live prompt saved (#{decoded.length} chars).")
+    end
+    dlg.add_action_callback("cancel") { |_, _| dlg.close }
+    dlg.show
+  end
+
+  # Live Render prompt editor. Defaults to DEFAULT_LIVE_RENDER_PROMPT — this
+  # one drives the gemini-2.5-flash-image call so it should describe the
+  # *visual* outcome (lighting, materials, mood), not the analytical commentary
+  # that the Live Stream prompt asks for.
+  def self.edit_live_render_prompt
+    cfg = load_config
+    current = cfg["live_render_prompt"] || DEFAULT_LIVE_RENDER_PROMPT
+    dlg = UI::HtmlDialog.new(
+      dialog_title:    "#{PLUGIN_NAME} — Edit Live Render Prompt",
+      preferences_key: "su_gpt_render_live_render_prompt_dlg",
+      scrollable:      true, resizable: true,
+      width: 640, height: 540,
+      style: UI::HtmlDialog::STYLE_DIALOG
+    )
+    cur_html = CGI.escapeHTML(current)
+    default_html = CGI.escapeHTML(DEFAULT_LIVE_RENDER_PROMPT).gsub("\n", '\\n').gsub("'", "\\\\'")
+    html = <<~HTML
+      <!doctype html><html><head><meta charset="utf-8">
+      <style>
+        body { font-family:-apple-system,"Helvetica Neue","PingFang HK","Microsoft JhengHei",sans-serif; margin:0; padding:14px; background:#f5f5f5; }
+        h2 { margin:0 0 8px 0; font-size:14px; color:#333; }
+        p.hint { margin:0 0 10px 0; font-size:12px; color:#666; line-height:1.4; }
+        textarea { width:100%; min-height:340px; box-sizing:border-box; font-family:"SF Mono",Consolas,monospace; font-size:12.5px; padding:10px; border:1px solid #ccc; border-radius:4px; resize:vertical; }
+        .row { margin-top:10px; display:flex; gap:8px; }
+        button { padding:8px 14px; border:1px solid #aaa; border-radius:4px; background:#fff; cursor:pointer; font-size:13px; }
+        button.primary { background:#2c80c0; color:#fff; border-color:#2c80c0; }
+        button.danger { color:#a00; border-color:#caa; }
+        .spacer { flex:1; }
+      </style></head><body>
+      <h2>Live Render prompt</h2>
+      <p class="hint">每次 frame 會用呢個 prompt 餵畀 gemini-2.5-flash-image。寫 visual outcome（lighting, material, mood）效果最好。</p>
+      <textarea id="prompt">#{cur_html}</textarea>
+      <div class="row">
+        <button class="primary" onclick="window.location='skp:save@'+encodeURIComponent(document.getElementById('prompt').value)">Save</button>
+        <button onclick="window.location='skp:cancel@'">Cancel</button>
+        <div class="spacer"></div>
+        <button class="danger" onclick="if(confirm('Reset?')){document.getElementById('prompt').value='#{default_html}';}">Reset</button>
+      </div>
+      </body></html>
+    HTML
+    dlg.set_html(html)
+    dlg.add_action_callback("save") do |_, value|
+      decoded = CGI.unescape(value.to_s)
+      cfg2 = load_config; cfg2["live_render_prompt"] = decoded; save_config(cfg2)
+      dlg.close
+      UI.messagebox("Live Render prompt saved (#{decoded.length} chars).")
     end
     dlg.add_action_callback("cancel") { |_, _| dlg.close }
     dlg.show

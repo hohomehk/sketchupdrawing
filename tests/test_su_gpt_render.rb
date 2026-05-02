@@ -1064,7 +1064,7 @@ end
 
 class TestVersionBump < Minitest::Test
   # Single source of truth — bump when releasing.
-  EXPECTED_VERSION = "0.4.4"
+  EXPECTED_VERSION = "0.5.0"
 
   def test_plugin_version_matches_expected
     assert_equal EXPECTED_VERSION, SuGptRender::PLUGIN_VERSION
@@ -1178,5 +1178,285 @@ class TestHttpRedirectFollowing < Minitest::Test
       end
       assert_match(/Too many redirects/, err.message)
     end
+  end
+end
+
+# ============================================================================
+# v0.5.0 — Live Render tab (gemini-2.5-flash-image via AI Gateway)
+# ============================================================================
+
+class TestImageModelsConstant < Minitest::Test
+  def test_image_models_constant_present
+    assert SuGptRender.const_defined?(:GEMINI_IMAGE_MODELS)
+    assert_includes SuGptRender::GEMINI_IMAGE_MODELS, "gemini-2.5-flash-image"
+  end
+
+  def test_image_model_not_in_thinking_disablable
+    # Image models reject thinkingConfig entirely. Must NOT be in
+    # GEMINI_THINKING_DISABLABLE — otherwise build_gemini_payload would still
+    # try to attach thinkingBudget=0 and the call would 400.
+    refute_includes SuGptRender::GEMINI_THINKING_DISABLABLE, "gemini-2.5-flash-image",
+      "image model must NOT appear in thinking-disablable list"
+  end
+
+  def test_payload_skips_thinking_and_max_tokens_for_image_models
+    tmp = Tempfile.new(["img", ".png"])
+    tmp.binmode; tmp.write("\x89PNG" + "x" * 64); tmp.close
+    payload = SuGptRender.build_gemini_payload(tmp.path, "render this",
+                                               model: "gemini-2.5-flash-image",
+                                               mime_type: "image/png")
+    refute payload.dig("generationConfig", "thinkingConfig"),
+      "image models must NOT receive thinkingConfig"
+    refute payload.dig("generationConfig", "maxOutputTokens"),
+      "image models need their full ~1290 token budget — no maxOutputTokens cap"
+    # Body shape — input image + prompt only.
+    parts = payload["contents"][0]["parts"]
+    assert_equal 2, parts.length
+    assert parts[0]["inlineData"]
+    assert_equal "render this", parts[1]["text"]
+    tmp.unlink
+  end
+
+  def test_live_render_models_constant
+    assert SuGptRender.const_defined?(:LIVE_RENDER_MODELS)
+    assert_equal "gemini-2.5-flash-image", SuGptRender::LIVE_RENDER_MODELS.first[0]
+  end
+end
+
+class TestCallGeminiImage < Minitest::Test
+  def setup
+    SuGptRender.stub_responses = nil
+    SuGptRender.stub_calls = []
+    @tmpimg = Tempfile.new(["lr", ".png"])
+    @tmpimg.binmode; @tmpimg.write("\x89PNG" + "x" * 200); @tmpimg.close
+  end
+
+  def teardown
+    return unless @tmpimg
+    # Sweep any rendered output the call wrote next to the input BEFORE
+    # we unlink (which nils out the path).
+    base = File.basename(@tmpimg.path, ".*")
+    out  = File.join(File.dirname(@tmpimg.path), "#{base}_render.png")
+    File.delete(out) if File.exist?(out)
+    @tmpimg.unlink
+  end
+
+  def test_call_gemini_image_request_shape_and_url
+    # Synthetic 1×1 PNG b64 — content doesn't matter for the test.
+    fake_png = Base64.strict_encode64("\x89PNG\r\n\x1a\nFAKE")
+    response = JSON.generate({
+      "candidates" => [{
+        "content" => { "parts" => [
+          { "inlineData" => { "mimeType" => "image/png", "data" => fake_png } }
+        ] },
+        "finishReason" => "STOP"
+      }],
+      "usageMetadata" => {
+        "candidatesTokensDetails" => [
+          { "modality" => "IMAGE", "tokenCount" => 1290 }
+        ]
+      }
+    })
+    SuGptRender.stub_responses = { "*" => FakeHttpResponse.new(200, response) }
+
+    out_path, tokens = SuGptRender.call_gemini_image(
+      @tmpimg.path, "render photoreal",
+      model: "gemini-2.5-flash-image", input_mime: "image/png"
+    )
+    assert File.exist?(out_path), "output PNG written to disk"
+    assert_equal 1290, tokens, "image-modality tokens parsed"
+
+    # Verify the POST went to the AI Gateway URL with the right path.
+    posts = SuGptRender.stub_calls.select { |c| c[0] == :post }
+    assert_equal 1, posts.length
+    posted_url = posts.first[1]
+    assert posted_url.start_with?(SuGptRender::GEMINI_AIG_URL),
+      "URL prefix is the AI Gateway base"
+    assert posted_url.include?("/v1beta/models/gemini-2.5-flash-image:generateContent"),
+      "URL targets the image model: #{posted_url}"
+
+    # Verify the body shape — inlineData input + text prompt, NO thinkingConfig.
+    payload = JSON.parse(posts.first[2])
+    parts = payload.dig("contents", 0, "parts")
+    assert_equal 2, parts.length
+    assert parts[0]["inlineData"], "first part is the input image"
+    assert_equal "image/png", parts[0]["inlineData"]["mimeType"]
+    assert_equal "render photoreal", parts[1]["text"]
+    refute payload.dig("generationConfig", "thinkingConfig"),
+      "image model: NO thinkingConfig in request"
+
+    # Cleanup the rendered output the function wrote.
+    File.delete(out_path) if File.exist?(out_path)
+  end
+
+  def test_call_gemini_image_uses_only_cf_aig_auth_headers
+    h = SuGptRender.gemini_aig_headers
+    assert_equal "Bearer #{SuGptRender::GEMINI_AIG_TOKEN}", h["cf-aig-authorization"]
+    refute h.key?("x-goog-api-key"),
+      "BYOK: Google key never sent from plugin (CF AI Gateway attaches it)"
+  end
+
+  def test_call_gemini_image_raises_on_http_error
+    SuGptRender.stub_responses = {
+      "*" => FakeHttpResponse.new(400, '{"error":{"message":"image too large"}}')
+    }
+    err = assert_raises(RuntimeError) {
+      SuGptRender.call_gemini_image(@tmpimg.path, "p")
+    }
+    assert err.message.include?("HTTP 400"), "got: #{err.message}"
+  end
+
+  def test_call_gemini_image_raises_when_no_image_in_response
+    response = JSON.generate({
+      "candidates" => [{ "content" => { "parts" => [{ "text" => "Sorry I can't" }] } }]
+    })
+    SuGptRender.stub_responses = { "*" => FakeHttpResponse.new(200, response) }
+    err = assert_raises(RuntimeError) {
+      SuGptRender.call_gemini_image(@tmpimg.path, "p")
+    }
+    assert err.message.include?("No inlineData"), "got: #{err.message}"
+  end
+end
+
+class TestLiveRenderState < Minitest::Test
+  def setup
+    File.delete(TEST_CFG_PATH) if File.exist?(TEST_CFG_PATH)
+    Sketchup.reset_model!
+    SuGptRender.instance_variable_set(:@liverender, {
+      enabled:        false,
+      in_flight:      false,
+      stop_flag:      false,
+      history:        [],
+      history_max:    8,
+      current_render: nil,
+      poll_timer:     nil,
+      tick_timer:     nil,
+      bg_thread:      nil,
+      queue:          nil,
+    })
+    SuGptRender.instance_variable_set(:@tray, nil)
+    UI.reset!
+  end
+
+  def test_state_initialized_with_or_equals_survives_reload
+    # Mirror test_load_preserves_module_ivars_with_or_equals — confirm the
+    # ||= guard keeps history etc. across `load __FILE__`.
+    SuGptRender.instance_variable_set(:@liverender,
+      { enabled: false, history: ["MARKER"], history_max: 8 })
+    tmp = Tempfile.new(["plugin_lr_ivar", ".rb"])
+    tmp.write <<~RUBY
+      module SuGptRender
+        @liverender ||= { enabled: false, history: [] }
+      end
+    RUBY
+    tmp.close
+    load tmp.path
+    state = SuGptRender.instance_variable_get(:@liverender)
+    assert_equal ["MARKER"], state[:history],
+      "||= must preserve in-flight history across hot-reload"
+    tmp.unlink
+  end
+
+  def test_start_stop_toggle
+    SuGptRender.start_live_render
+    assert SuGptRender.instance_variable_get(:@liverender)[:enabled]
+    SuGptRender.stop_live_render
+    refute SuGptRender.instance_variable_get(:@liverender)[:enabled]
+    SuGptRender.toggle_live_render
+    assert SuGptRender.instance_variable_get(:@liverender)[:enabled]
+    SuGptRender.toggle_live_render
+    refute SuGptRender.instance_variable_get(:@liverender)[:enabled]
+  end
+
+  def test_stop_clears_timers
+    SuGptRender.start_live_render
+    refute_empty UI.timers
+    SuGptRender.stop_live_render
+    lr = SuGptRender.instance_variable_get(:@liverender)
+    assert_nil lr[:poll_timer]
+    assert_nil lr[:tick_timer]
+  end
+end
+
+class TestLiveRenderCost < Minitest::Test
+  def setup
+    File.delete(TEST_CFG_PATH) if File.exist?(TEST_CFG_PATH)
+  end
+
+  def test_count_starts_at_zero
+    assert_equal 0, SuGptRender.live_render_count_today
+    assert_equal 0.0, SuGptRender.live_render_cost_today
+  end
+
+  def test_bump_writes_to_config
+    SuGptRender.bump_live_render_count(1290)
+    SuGptRender.bump_live_render_count(1290)
+    assert_equal 2, SuGptRender.live_render_count_today
+    cfg = SuGptRender.load_config
+    today = Time.now.strftime("%Y-%m-%d")
+    assert_equal 2, cfg["live_render_counts"][today]
+    assert_equal 2580, cfg["live_render_tokens"][today]
+  end
+
+  def test_cost_today_for_known_token_count
+    # 1290 image-output tokens × $0.40/M = $0.000516 → rounded to 4 d.p.
+    SuGptRender.bump_live_render_count(1290)
+    cost = SuGptRender.live_render_cost_today
+    # Round(0.000516, 4) = 0.0005
+    assert_in_delta 0.0005, cost, 0.0001,
+      "1290 tokens at $0.40/M ≈ $0.0005, got #{cost}"
+  end
+
+  def test_cost_today_scales_with_tokens
+    # 20 renders × 1290 tokens = 25800 tokens × 0.40e-6 = 0.01032 → 0.0103
+    20.times { SuGptRender.bump_live_render_count(1290) }
+    cost = SuGptRender.live_render_cost_today
+    assert_in_delta 0.0103, cost, 0.001
+  end
+end
+
+class TestLiveRenderTabUi < Minitest::Test
+  def setup
+    Sketchup.reset_model!
+    File.delete(TEST_CFG_PATH) if File.exist?(TEST_CFG_PATH)
+    SuGptRender.instance_variable_set(:@liverender, {
+      enabled: false, in_flight: false, stop_flag: false,
+      history: [], history_max: 8, current_render: nil,
+      poll_timer: nil, tick_timer: nil, bg_thread: nil, queue: nil,
+    })
+  end
+
+  def test_tab_button_present
+    html = SuGptRender.tray_html
+    assert html.include?("Live Render"), "tab label rendered"
+    assert html.include?("liver_pane"),  "pane element rendered"
+    assert html.include?("toggleLiveRender"), "JS handler wired"
+    assert html.include?("mt_liver"),    "tab button id"
+  end
+
+  def test_tab_has_model_dropdown_and_interval
+    html = SuGptRender.tray_html
+    assert html.include?("liver_model"),    "model dropdown present"
+    assert html.include?("gemini-2.5-flash-image"), "default image model rendered"
+    assert html.include?("liver_interval"), "interval selector present"
+    assert html.include?("Render interval"), "interval label visible"
+  end
+
+  def test_tab_has_two_image_cells_and_history_strip
+    html = SuGptRender.tray_html
+    assert html.include?("liver_frame_in"),  "captured frame cell"
+    assert html.include?("liver_frame_out"), "AI render cell"
+    assert html.include?("liver_history"),   "history strip container"
+  end
+
+  def test_tab_has_cost_meter
+    html = SuGptRender.tray_html
+    assert html.include?("liver_today"), "cost meter element present"
+    assert html.match?(/0 renders.*\$0\.0000/), "cost meter renders 0/0 by default"
+  end
+
+  def test_default_live_render_prompt_constant
+    assert SuGptRender::DEFAULT_LIVE_RENDER_PROMPT.length > 50
+    assert SuGptRender::DEFAULT_LIVE_RENDER_PROMPT.downcase.include?("photorealistic")
   end
 end

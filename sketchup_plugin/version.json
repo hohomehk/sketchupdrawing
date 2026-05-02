@@ -1,5 +1,5 @@
 {
-  "version": "0.4.4",
-  "rb_url": "https://github.com/hohomehk/sketchupdrawing/releases/download/v0.4.4/su_gpt_render.rb",
-  "notes": "v0.4.4 — Live Stream output now persists across frames. setLiveFrame was wiping live_output every tick (~every 2s), so the streamed text appeared and immediately disappeared. Now each frame's reply lands in its own timestamped paragraph; older replies stay visible. Output area is scrollable (max-height 280px). Start Live still clears the log."
+  "version": "0.5.0",
+  "rb_url": "https://github.com/hohomehk/sketchupdrawing/releases/download/v0.5.0/su_gpt_render.rb",
+  "notes": "v0.5.0 — New Live Render tab (6th tab). Captures the current SU view and feeds it to Gemini 2.5 Flash Image (via Cloudflare AI Gateway) every 5–30s, producing a photorealistic render side-by-side with the input frame. Picks model from a dropdown (gemini-2.5-flash-image default), interval picker (5/10/20/30s), editable render prompt, last-8 history strip, today's render count + cost meter ($0.40/M output tokens; ~$0.0005/render). All HTTP runs on a background thread (~10s blocking) — UI never freezes. New constants: GEMINI_IMAGE_MODELS. New method: call_gemini_image. build_gemini_payload now skips thinkingConfig + maxOutputTokens for image models (they reject both)."
 }
