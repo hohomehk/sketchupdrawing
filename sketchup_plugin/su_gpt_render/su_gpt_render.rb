@@ -14,7 +14,7 @@ require 'thread'   # Queue used by Live Stream main↔bg thread handoff
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.6.0"
+  PLUGIN_VERSION = "0.6.1"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -420,9 +420,11 @@ module SuGptRender
   # parses the markdown image URL out of the response, downloads it next to
   # the input PNG. Returns [output_path, completion_tokens] so the cost meter
   # can use the per-model rate from LIVE_RENDER_MODELS.
-  def self.call_poe_image_for_live_render(input_image_paths, prompt, live_render_id, material_table: nil)
-    paths = Array(input_image_paths)   # accept either a single path or [geom, material]
+  def self.call_poe_image_for_live_render(input_image_paths, prompt, live_render_id,
+                                          material_table: nil, view_count: nil)
+    paths = Array(input_image_paths)
     raise "no input images" if paths.empty?
+    view_count ||= paths.length   # legacy single-batch callers
     cfg = load_config
     api_key = cfg["poe_api_key"].to_s
     raise "Poe API key missing — set it in tray Render tab" if api_key.empty?
@@ -434,7 +436,7 @@ module SuGptRender
                 else live_render_id
                 end
 
-    final_prompt = build_multi_view_preamble(paths.length, prompt, material_table)
+    final_prompt = build_multi_view_preamble(view_count, prompt, material_table)
 
     content_arr = [{ "type" => "text", "text" => final_prompt }]
     paths.each do |p|
@@ -464,7 +466,7 @@ module SuGptRender
     # Save next to first input.
     primary = paths.first
     in_dir = File.dirname(primary)
-    base = File.basename(primary, ".*").sub(/_lr_(geom|raw|material)$/, "_lr")
+    base = File.basename(primary, ".*").sub(/_lr_(geom|raw|material|colour)$/, "_lr")
     out_path = File.join(in_dir, "#{base}_render.png")
     download(img_url, out_path)
 
@@ -509,14 +511,20 @@ module SuGptRender
   def self.build_gemini_payload(image_path_or_paths, prompt,
                                 model: "gemini-2.5-flash",
                                 mime_type: "image/jpeg", max_output_tokens: 1024,
-                                aspect_ratio: nil, material_table: nil)
+                                aspect_ratio: nil, material_table: nil,
+                                view_count: nil)
     paths = Array(image_path_or_paths)
     raise "no input images" if paths.empty?
     parts = paths.map { |p|
       img_b64 = Base64.strict_encode64(File.binread(p))
       { "inlineData" => { "mimeType" => mime_type, "data" => img_b64 } }
     }
-    final_prompt = build_multi_view_preamble(paths.length, prompt, material_table)
+    # view_count distinguishes the SU view captures (first N images) from
+    # texture-swatch reference images (last M). The preamble uses N to
+    # describe "you are receiving N views of the SAME 3D scene" — without
+    # the override it'd lie about the geom-vs-material setup.
+    nv = view_count || paths.length
+    final_prompt = build_multi_view_preamble(nv, prompt, material_table)
     parts << { "text" => final_prompt }
     body = { "contents" => [{ "parts" => parts }] }
     # Image-output models (gemini-2.5-flash-image et al.) do NOT accept
@@ -578,13 +586,15 @@ module SuGptRender
                              model: "gemini-2.5-flash-image",
                              input_mime: "image/png",
                              aspect_ratio: nil,
-                             material_table: nil)
+                             material_table: nil,
+                             view_count: nil)
     paths = Array(input_image_path_or_paths)
     url = "#{GEMINI_AIG_URL}/v1beta/models/#{model}:generateContent"
     payload = build_gemini_payload(paths, prompt,
                                    model: model, mime_type: input_mime,
                                    aspect_ratio: aspect_ratio,
-                                   material_table: material_table)
+                                   material_table: material_table,
+                                   view_count: view_count)
     res = http_post_json(url, gemini_aig_headers, JSON.generate(payload))
     unless res.is_a?(Net::HTTPSuccess)
       raise "Gemini Image AI Gateway HTTP #{res.code}: #{res.body[0,300]}"
@@ -601,7 +611,7 @@ module SuGptRender
     # name so we don't end up with "..._lr_geom_render.png".
     primary = paths.first
     in_dir = File.dirname(primary)
-    base = File.basename(primary, ".*").sub(/_lr_(geom|raw|material)$/, "_lr")
+    base = File.basename(primary, ".*").sub(/_lr_(geom|raw|material|colour)$/, "_lr")
     out_path = File.join(in_dir, "#{base}_render.png")
     File.binwrite(out_path, out_bytes)
 
@@ -1221,13 +1231,20 @@ module SuGptRender
 
     write_one = ->(suffix, style) {
       out = File.join(out_dir, "#{timestamp}_#{base}_lr_#{suffix}.png")
+      do_write = lambda {
+        ok = model.active_view.write_image(filename: out, width: width,
+                                           height: height, antialias: true,
+                                           transparent: false)
+        raise "write_image #{suffix} failed" unless ok
+      }
       with_face_style(model, style) do
         with_marker_background(model) do
           with_flat_lighting(model) do
-            ok = model.active_view.write_image(filename: out, width: width,
-                                               height: height, antialias: true,
-                                               transparent: false)
-            raise "write_image #{suffix} failed" unless ok
+            if style == "hidden_line"
+              with_clean_edges(model, &do_write)
+            else
+              do_write.call
+            end
           end
         end
       end
@@ -1235,15 +1252,21 @@ module SuGptRender
     }
 
     if multi_view
-      # 2-pass capture for multi-image conditioning: Hidden Line for pure
-      # geometry constraint, Shaded with Texture for material/colour. We
-      # deliberately skip Monochrome — adds tokens without much extra signal
-      # for diffusion models.
+      # 2-pass capture for multi-image conditioning:
+      #   geom  = Hidden Line — pure geometry constraint
+      #   colour = Shaded (NO texture, just flat material colours) — clean
+      #            HEX zones the model can cross-reference against the
+      #            material-table HEX column. Texture detail comes from
+      #            separately-uploaded texture swatches; bundling textures
+      #            into View 2 confuses the diffusion model because the
+      #            texture noise muddies the colour-to-material mapping.
       [
-        write_one.("geom",     "hidden_line"),
-        write_one.("material", "shaded_with_texture"),
+        write_one.("geom",   "hidden_line"),
+        write_one.("colour", "shaded"),
       ]
     else
+      # Single-view: keep the textured shaded for backward compat (shows
+      # what a designer eyeballs).
       [write_one.("raw", "shaded_with_texture")]
     end
   end
@@ -1261,6 +1284,36 @@ module SuGptRender
     "monochrome"         => 4,
     "xray"               => 5,
   }.freeze
+
+  # Hidden-Line captures look "sketchy" by default — Profiles emphasises
+  # silhouettes with thick lines, Depth Cue fades distant edges, Jitter +
+  # Extension add hand-drawn artistic effects. ALL of those add noise to
+  # what the AI sees. We force them off during capture and restore on exit.
+  def self.with_clean_edges(model)
+    ro = model.rendering_options rescue nil
+    saved = {}
+    keys = ["DrawProfilesOnly", "DrawProfile", "DrawProfiles", "EdgeProfileWidth",
+            "DrawDepthQue", "JitterEdges", "ExtendEdges", "DrawHidden",
+            "DisplayInstructions", "DisplaySketchAxes", "DisplaySectionCuts"]
+    if ro
+      keys.each { |k| saved[k] = ro[k] rescue nil }
+      ro["DrawProfilesOnly"] = false rescue nil
+      ro["DrawProfile"]      = false rescue nil
+      ro["DrawProfiles"]     = false rescue nil
+      ro["EdgeProfileWidth"] = 0     rescue nil   # 0 = no extra silhouette weight
+      ro["DrawDepthQue"]     = false rescue nil   # no fade on far edges
+      ro["JitterEdges"]      = false rescue nil   # no sketchy hand-drawn lines
+      ro["ExtendEdges"]      = false rescue nil   # no extending past corners
+      ro["DrawHidden"]       = false rescue nil   # no see-through ghost edges
+    end
+    begin
+      yield
+    ensure
+      if ro
+        saved.each { |k, v| ro[k] = v rescue nil unless v.nil? }
+      end
+    end
+  end
 
   def self.with_face_style(model, style_name)
     ro = model.rendering_options rescue nil
@@ -1305,8 +1358,11 @@ module SuGptRender
         • Image 1 (HIDDEN-LINE wireframe): EXACT geometry constraint. Every
           edge, corner, and panel division MUST appear in your output — do
           NOT smooth, round, merge, or invent geometry.
-        • Image 2 (SHADED with materials): use ONLY for material / colour
-          assignment. Geometry is locked by Image 1.
+        • Image 2 (SHADED — flat colour zones, NO texture): tells you
+          which region uses which material. Each visible solid colour
+          matches the HEX column in the material table below; that is
+          how you map "which region is which material". Geometry is
+          locked by Image 1.
     V
 
     capture_section = <<~CAP
@@ -1327,14 +1383,18 @@ module SuGptRender
 
           #{material_table}
 
-          The HEX value in column 1 is the RGB colour you will see in the
-          shaded view (Image 2). For every visible coloured region in the
-          render, match it to a row above and render that region as the
-          named material would look in a real photograph (real wood grain,
-          real fabric weave, real metal sheen, real glass refraction, etc.).
-          Do NOT invent materials beyond this list. If a region's colour
-          matches multiple rows, pick the one whose name best fits its
-          architectural role (e.g. cabinet door vs floor).
+          For every visible coloured region in the render, match it to a row
+          above by HEX and render that region as the named material would
+          look in a real photograph (real wood grain, real fabric weave,
+          real metal sheen, real glass refraction). Do NOT invent materials
+          beyond this list.
+
+          The "Texture ref" column may say "Image N" — those are TEXTURE
+          SWATCHES uploaded as additional input images (after the 2 view
+          captures). Look at swatch image N to see the actual visual
+          appearance of that material; apply that texture/colour/sheen to
+          the matching region in your render. NEVER include the swatch
+          itself as a scene element — it is reference only.
         TBL
       else
         ""
@@ -1375,6 +1435,58 @@ module SuGptRender
     [model.entities, "whole model"]
   end
 
+  # Extract texture images from the materials in the active scope so we
+  # can attach them as Gemini reference inlineData. SU's Sketchup::Texture
+  # has a #write(filepath) method (SU 2018+) that saves the texture to
+  # disk in its original format. We dump up to MAX_TEXTURES into a temp
+  # dir and return a list of {material:, path:, name:, hex:} so the
+  # call site can both attach them as inline images and label them in
+  # the material table.
+  MAX_TEXTURES_PER_RENDER  = 8
+  # Skip texture upload for any texture whose file is larger than this.
+  # Token cost note: Gemini tiles each input image ~768×768 = ~258 tokens.
+  # A 1024² PNG is fine (~258 tokens); a 4K texture image splits into many
+  # tiles and inflates input cost. 500 KB ~ 1024² PNG ceiling.
+  # NOTE: SU Ruby API has no native resize, so v0.6.1 just SKIPS oversized
+  # textures (the material stays in the table by name+hex; the AI gets
+  # less detail for that one but the cost stays bounded). v0.6.2 plans to
+  # add an in-Ruby ImageRep bilinear-downscale for true downsize.
+  MAX_TEXTURE_FILE_BYTES = 500 * 1024
+
+  def self.extract_used_textures(model, out_dir, max_count: MAX_TEXTURES_PER_RENDER)
+    materials = collect_used_materials(model)
+    textures = []
+    skipped_too_large = []
+    materials.each do |m|
+      break if textures.length >= max_count
+      next unless m && m.respond_to?(:texture) && m.texture
+      tex = m.texture
+      next unless tex.respond_to?(:write)
+      name = (m.respond_to?(:display_name) ? m.display_name : m.name).to_s
+      next if name.empty?
+      ext = ((tex.filename rescue "") || "").split(".").last.to_s.downcase
+      ext = "png" unless %w[png jpg jpeg].include?(ext)
+      safe_name = name.gsub(/[^\w一-鿿\-]/, "_")[0, 40]
+      out = File.join(out_dir, "tex_#{textures.length + 1}_#{safe_name}.#{ext}")
+      ok = (tex.write(out, false) rescue false)
+      next unless ok && File.exist?(out) && File.size(out) > 0
+      sz = File.size(out)
+      if sz > MAX_TEXTURE_FILE_BYTES
+        File.delete(out) rescue nil
+        skipped_too_large << "#{name} (#{(sz / 1024.0).round} KB)"
+        next
+      end
+      c = (m.color rescue nil)
+      hex = c ? format("#%02X%02X%02X", c.red, c.green, c.blue) : "(none)"
+      textures << { material: m, path: out, name: name, hex: hex,
+                    mime: ext == "jpg" || ext == "jpeg" ? "image/jpeg" : "image/png" }
+    end
+    if !skipped_too_large.empty?
+      puts "[GPT Render Live] textures skipped (>#{MAX_TEXTURE_FILE_BYTES/1024} KB): #{skipped_too_large.join(', ')}"
+    end
+    textures
+  end
+
   def self.collect_used_materials(model)
     return [] unless model && model.respond_to?(:entities)
     scope, label = live_render_material_scope(model)
@@ -1404,38 +1516,43 @@ module SuGptRender
     seen.values
   end
 
-  # Markdown table of in-use materials only (purge-unused-style filtering
-  # without mutating the .skp). Each row: hex colour → human-readable name
-  # → texture-or-solid hint. Typical interior project: 5-15 rows.
-  #
-  # Sits inside the prompt preamble; cost is ~50-200 extra input tokens,
-  # ≈ negligible. Capped to 30 rows to keep prompt size sane on huge models.
-  def self.collect_model_material_table(model)
+  # Markdown table of in-use materials. With texture_meta: passes in the
+  # extracted-texture list so the table can label each textured material
+  # with its uploaded "Image #" — the model can then look up which inline
+  # image is the texture swatch for that material.
+  def self.collect_model_material_table(model, texture_meta: [], view_count: 1)
     materials = collect_used_materials(model)
+    # Map material.object_id → image number (1-indexed, in the order they
+    # appear in the request: views first, then textures).
+    img_for = {}
+    texture_meta.each_with_index do |tm, idx|
+      img_for[tm[:material].object_id] = view_count + 1 + idx if tm[:material]
+    end
+
     rows = []
     materials.each do |m|
       next unless m
       name = (m.respond_to?(:display_name) ? m.display_name : m.name).to_s
       next if name.empty?
       c = m.color rescue nil
-      rgb_hex = c ? format("#%02X%02X%02X", c.red, c.green, c.blue) : "(none)"
+      hex = c ? format("#%02X%02X%02X", c.red, c.green, c.blue) : "(none)"
       tex = (m.respond_to?(:texture) && m.texture) ? m.texture : nil
       tex_hint =
         if tex
           fn = (tex.filename rescue "") || ""
-          fn.empty? ? "textured" : "texture: #{File.basename(fn)}"
+          fn.empty? ? "textured" : "tex: #{File.basename(fn)}"
         else
-          "solid"
+          alpha = m.respond_to?(:alpha) ? (m.alpha rescue 1.0) : 1.0
+          alpha && alpha < 0.95 ? "translucent" : "solid"
         end
-      alpha = m.respond_to?(:alpha) ? (m.alpha rescue 1.0) : 1.0
-      tx = (alpha && alpha < 0.95) ? " · #{format('%.0f%%', alpha * 100)} opacity" : ""
-      rows << "| `#{rgb_hex}` | #{name} | #{tex_hint}#{tx} |"
+      img_ref = img_for[m.object_id] ? "Image #{img_for[m.object_id]}" : "—"
+      rows << "| `#{hex}` | #{name} | #{tex_hint} | #{img_ref} |"
     end
     return "" if rows.empty?
     rows = rows.first(30)
     (
-      ["| HEX | Material name | Hint |",
-       "|---|---|---|"] + rows
+      ["| HEX | Material name | Hint | Texture ref |",
+       "|---|---|---|---|"] + rows
     ).join("\n")
   end
 
@@ -1571,19 +1688,33 @@ module SuGptRender
     height = (cfg["live_render_height"] || 1024).to_i
     aspect = cfg["live_render_aspect"] || "1:1"   # 1:1, 16:9, 9:16, 4:3, 3:4
     multi  = cfg["live_render_multi_view"] != false   # default ON in v0.5.7+
-    mat_table = collect_model_material_table(Sketchup.active_model)
-    @liverender[:current_material_table] = mat_table   # exposed for UI preview
-    puts "[GPT Render Live] kick: capturing #{width}x#{height} model=#{model} aspect=#{aspect} multi=#{multi} materials=#{mat_table.lines.size} rows"
+    upload_textures = cfg["live_render_upload_textures"] != false   # default ON
+    puts "[GPT Render Live] kick: capturing #{width}x#{height} model=#{model} aspect=#{aspect} multi=#{multi} textures=#{upload_textures}"
 
     raw_paths = nil
+    texture_meta = []
     begin
       raw_paths = export_view_for_live_render(width, height, multi_view: multi)
       puts "[GPT Render Live] capture OK: #{raw_paths.length} view(s) → #{raw_paths.map { |p| File.basename(p) }.join(', ')}"
+      if upload_textures
+        # Drop textures into a sibling subdir so cleanup is one rmtree.
+        tex_dir = File.join(File.dirname(raw_paths.first), "textures")
+        FileUtils.mkdir_p(tex_dir)
+        texture_meta = extract_used_textures(Sketchup.active_model, tex_dir)
+        puts "[GPT Render Live] textures attached: #{texture_meta.length}"
+      end
     rescue => e
       puts "[GPT Render Live] capture FAIL: #{e.class}: #{e.message}"
       push_live_render_status("Capture failed: #{e.message}", "err")
       return
     end
+    # Material table now references texture image numbers (views are 1..N,
+    # textures are N+1..N+T, in the order they're added to the request).
+    mat_table = collect_model_material_table(Sketchup.active_model,
+                                             texture_meta: texture_meta,
+                                             view_count: raw_paths.length)
+    texture_paths = texture_meta.map { |t| t[:path] }
+    all_input_paths = raw_paths + texture_paths
     # In multi-view mode raw_paths is [geom, shaded]; in single-view it's [shaded].
     geom_path   = raw_paths.length >= 2 ? raw_paths.first : nil
     shaded_path = raw_paths.last
@@ -1605,20 +1736,29 @@ module SuGptRender
         end
         render_path, tokens =
           if provider == :poe
-            call_poe_image_for_live_render(raw_paths, prompt, model,
-                                            material_table: mat_table)
+            call_poe_image_for_live_render(all_input_paths, prompt, model,
+                                            material_table: mat_table,
+                                            view_count: raw_paths.length)
           else
-            call_gemini_image(raw_paths, prompt,
+            call_gemini_image(all_input_paths, prompt,
                               model: model,
                               input_mime: "image/png",
                               aspect_ratio: aspect,
-                              material_table: mat_table)
+                              material_table: mat_table,
+                              view_count: raw_paths.length)
           end
         elapsed = (Time.now - started).round(1)
         puts "[GPT Render Live] render OK (#{provider}): #{render_path} (#{tokens} tokens, #{elapsed}s)"
-        # Default: drop ALL raw SU views we just sent (geom + material + …).
-        # Only the AI render is interesting to keep. Set live_render_keep_raw=
-        # true to retain them for debugging / before-after comparison.
+        # Default: drop ALL raw SU views + extracted texture swatches we just
+        # sent — only the AI render is interesting to keep. Texture swatches
+        # always go (they're regenerated each tick from the .skp); raw views
+        # respect live_render_keep_raw.
+        texture_paths.each { |p| File.delete(p) rescue nil if p && File.exist?(p) }
+        # Try to remove the texture subdir if empty (best-effort).
+        if !texture_paths.empty?
+          tex_dir = File.dirname(texture_paths.first)
+          (Dir.rmdir(tex_dir) rescue nil)
+        end
         keep_raw = (load_config["live_render_keep_raw"] == true) rescue false
         if !keep_raw
           raw_paths.each { |p| File.delete(p) rescue nil if p && File.exist?(p) }
@@ -2170,11 +2310,13 @@ module SuGptRender
           </div>
 
           <div class="grid row">
-            <label>Capture resolution
+            <label>Capture resolution (input → Gemini)
               <select id="liver_resolution" onchange="setLiveRenderResolution()">
-                <option value="512"  #{liver_resolution == 512  ? 'selected' : ''}>512×512  (smallest)</option>
-                <option value="768"  #{liver_resolution == 768  ? 'selected' : ''}>768×768</option>
-                <option value="1024" #{liver_resolution == 1024 ? 'selected' : ''}>1024×1024 (default)</option>
+                <option value="512"  #{liver_resolution == 512  ? 'selected' : ''}>512×512   (~1× cost · least detail)</option>
+                <option value="768"  #{liver_resolution == 768  ? 'selected' : ''}>768×768   (~1× cost)</option>
+                <option value="1024" #{liver_resolution == 1024 ? 'selected' : ''}>1024×1024 (~1× cost · default ⭐)</option>
+                <option value="1536" #{liver_resolution == 1536 ? 'selected' : ''}>1536×1536 (~2× cost · sharper detail)</option>
+                <option value="2048" #{liver_resolution == 2048 ? 'selected' : ''}>2048×2048 (~4× cost · max detail)</option>
               </select>
             </label>
             <label>Output aspect (same cost)
