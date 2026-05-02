@@ -14,7 +14,7 @@ require 'thread'   # Queue used by Live Stream main↔bg thread handoff
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.5.7"
+  PLUGIN_VERSION = "0.5.8"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -1436,8 +1436,11 @@ module SuGptRender
       push_live_render_status("Capture failed: #{e.message}", "err")
       return
     end
-    raw_path = raw_paths.last   # show the shaded view (more visually informative) in the UI cell
-    push_live_render_frame(raw_path, nil)
+    # In multi-view mode raw_paths is [geom, shaded]; in single-view it's [shaded].
+    geom_path   = raw_paths.length >= 2 ? raw_paths.first : nil
+    shaded_path = raw_paths.last
+    raw_path    = shaded_path  # back-compat for downstream code that wants "the" capture
+    push_live_render_frame(geom_path, shaded_path, nil)
     @liverender[:in_flight] = true
     push_live_render_status("Rendering (#{model}) ~10s…", "busy")
     puts "[GPT Render Live] kick: bg thread starting…"
@@ -1505,7 +1508,10 @@ module SuGptRender
       case kind
       when :render
         record_live_render(payload)
-        push_live_render_frame(payload[:raw_path], payload[:render_path])
+        # The render-side push: only the rendered output is new at this
+        # point — geom + shaded inputs were already pushed before the bg
+        # call, so we pass nil for those to avoid re-fetching.
+        push_live_render_frame(nil, nil, payload[:render_path])
         push_live_render_done(payload)
         push_live_render_status(
           "Rendered in #{payload[:elapsed]}s · #{payload[:tokens]} img tokens", "ok"
@@ -1751,6 +1757,8 @@ module SuGptRender
         .preview .hint { position:absolute; bottom:10px; right:10px; background:rgba(0,0,0,.7); color:#fff; font-size:10px; padding:3px 7px; border-radius:3px; pointer-events:none; opacity:0; transition:opacity .15s; }
         .preview:hover .hint { opacity:1; }
         .preview .empty { padding:20px; text-align:center; opacity:.4; font-size:11px; }
+        .liver-cell .cell-label { position:absolute; top:4px; left:6px; background:rgba(0,0,0,.6); color:#bbb; font-size:9.5px; padding:2px 6px; border-radius:2px; pointer-events:none; z-index:2; }
+        .liver-cell { position:relative; }
         select { background:#2a2a2a; color:#eee; border:1px solid #3a3a3a; padding:5px 8px; border-radius:4px; width:100%; font-size:13px; }
         /* sub-tabs (Enhanced/Raw) */
         .tabs { display:flex; gap:4px; margin-bottom:6px; }
@@ -2054,13 +2062,20 @@ module SuGptRender
             <div>Provider</div><div><code>#{liver_provider == :poe ? 'Poe (cheap, public CDN)' : 'CF AI Gateway (private, direct Google)'}</code></div>
           </div>
 
-          <h3>Captured frame &nbsp;→&nbsp; AI Render</h3>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-            <div class="preview" style="min-height:120px">
+          <h3>Captured views &nbsp;→&nbsp; AI Render</h3>
+          <div id="liver_grid" style="display:grid;grid-template-columns:repeat(3, 1fr);gap:8px;">
+            <div class="preview liver-cell" style="min-height:120px">
+              <div class="cell-label">Hidden Line (geometry)</div>
+              <div id="liver_frame_geom_empty" class="empty">— captured when multi-view ON —</div>
+              <img id="liver_frame_geom" style="display:none" onclick="liverOpen('geom')">
+            </div>
+            <div class="preview liver-cell" style="min-height:120px">
+              <div class="cell-label">Shaded (materials)</div>
               <div id="liver_frame_in_empty" class="empty">Captured SU view appears here</div>
               <img id="liver_frame_in" style="display:none" onclick="liverOpen('in')">
             </div>
-            <div class="preview" style="min-height:120px">
+            <div class="preview liver-cell" style="min-height:120px">
+              <div class="cell-label">AI Render</div>
               <div id="liver_frame_out_empty" class="empty">AI render appears here ~10s after capture</div>
               <img id="liver_frame_out" style="display:none" onclick="liverOpen('out')">
             </div>
@@ -2212,7 +2227,7 @@ module SuGptRender
           if (t) t.textContent = todayCount + ' streams · ~$' + todayCost;
         }
         // Live Render
-        let liverInUrl = null, liverOutUrl = null;
+        let liverGeomUrl = null, liverInUrl = null, liverOutUrl = null;
         function toggleLiveRender()       { sketchup.toggle_live_render(''); }
         function setLiveRenderInterval()  { sketchup.set_live_render_interval(document.getElementById('liver_interval').value); }
         function setLiveRenderModel()     { sketchup.set_live_render_model(document.getElementById('liver_model').value); }
@@ -2231,24 +2246,26 @@ module SuGptRender
             pill.className   = 'aiw-status ' + (enabled ? 'on' : 'off');
           }
         }
-        function setLiveRenderFrames(rawUrl, renderUrl) {
-          if (rawUrl) {
-            liverInUrl = rawUrl;
-            const i = document.getElementById('liver_frame_in');
-            const e = document.getElementById('liver_frame_in_empty');
-            if (i) { i.src = rawUrl + '?_=' + Date.now(); i.style.display = 'block'; }
-            if (e) e.style.display = 'none';
+        // setLiveRenderFrames(geomUrl, shadedUrl, renderUrl) — any can be null.
+        // For 1-view captures, geomUrl is null.
+        function setLiveRenderFrames(geomUrl, shadedUrl, renderUrl) {
+          function show(idImg, idEmpty, url) {
+            const i = document.getElementById(idImg);
+            const e = document.getElementById(idEmpty);
+            if (url) {
+              if (i) { i.src = url + '?_=' + Date.now(); i.style.display = 'block'; }
+              if (e) e.style.display = 'none';
+            }
           }
-          if (renderUrl) {
-            liverOutUrl = renderUrl;
-            const i = document.getElementById('liver_frame_out');
-            const e = document.getElementById('liver_frame_out_empty');
-            if (i) { i.src = renderUrl + '?_=' + Date.now(); i.style.display = 'block'; }
-            if (e) e.style.display = 'none';
-          }
+          if (geomUrl)   { liverGeomUrl   = geomUrl;   show('liver_frame_geom','liver_frame_geom_empty', geomUrl); }
+          if (shadedUrl) { liverInUrl     = shadedUrl; show('liver_frame_in',  'liver_frame_in_empty',   shadedUrl); }
+          if (renderUrl) { liverOutUrl    = renderUrl; show('liver_frame_out', 'liver_frame_out_empty',  renderUrl); }
         }
         function liverOpen(side) {
-          const url = side === 'in' ? liverInUrl : liverOutUrl;
+          let url = null;
+          if      (side === 'geom') url = liverGeomUrl;
+          else if (side === 'in')   url = liverInUrl;
+          else                      url = liverOutUrl;
           if (url) sketchup.open_url(url);
         }
         function setLiveRenderHistory(html) {
@@ -2817,13 +2834,30 @@ module SuGptRender
     push_status(msg, cls)
   end
 
-  def self.push_live_render_frame(raw_path, render_path)
+  # Push captured views + render to the tray. Multi-view captures pass
+  # geom_path (Hidden Line) AND shaded_path (Shaded with Textures); single-
+  # view callers pass nil for geom and the lone capture as shaded.
+  def self.push_live_render_frame(geom_path_or_legacy_raw, render_path_or_shaded_path = nil, render_path = nil)
     return unless @tray && @tray.visible?
-    raw_url    = raw_path    ? "file://" + raw_path.gsub("\\", "/")    : nil
-    render_url = render_path ? "file://" + render_path.gsub("\\", "/") : nil
-    @tray.execute_script(
-      "setLiveRenderFrames(#{raw_url ? raw_url.to_json : 'null'}, #{render_url ? render_url.to_json : 'null'})"
-    )
+    # Backward-compat: old callers do push_live_render_frame(raw, render).
+    # New (multi-view) callers do push_live_render_frame(geom, shaded, render).
+    if render_path.nil?
+      # Old 2-arg form: arg1 = single capture (treated as shaded), arg2 = render.
+      geom_path   = nil
+      shaded_path = geom_path_or_legacy_raw
+      render_path = render_path_or_shaded_path
+    else
+      geom_path   = geom_path_or_legacy_raw
+      shaded_path = render_path_or_shaded_path
+    end
+    to_url = ->(p) { p ? "file://" + p.gsub("\\", "/") : nil }
+    geom_url, shaded_url, render_url =
+      to_url.call(geom_path), to_url.call(shaded_path), to_url.call(render_path)
+    js = "setLiveRenderFrames(" \
+         "#{geom_url   ? geom_url.to_json   : 'null'}, " \
+         "#{shaded_url ? shaded_url.to_json : 'null'}, " \
+         "#{render_url ? render_url.to_json : 'null'})"
+    @tray.execute_script(js)
   end
 
   def self.push_live_render_done(_entry)

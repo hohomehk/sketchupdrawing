@@ -1,5 +1,5 @@
 {
-  "version": "0.5.7",
+  "version": "0.5.8",
   "rb_url": "https://hohomehk-plugin.ngrok.app/su_gpt_render.rb",
-  "notes": "v0.5.7 — Multi-view conditioning to fight diffusion-model hallucination. Each Live Render tick now (by default) captures TWO SU views: a HIDDEN-LINE wireframe locking exact geometry, and a SHADED-WITH-TEXTURES capture for material/colour reference. Both go into the same generateContent call with a role-tagged preamble: 'Image 1 = exact geometry constraint; Image 2 = materials only.' Diffusion models follow this much better than a single image + long negative prompt. UI dropdown lets you fall back to single-view if you want lower latency. Works on both Poe and CF Gateway paths. Adds with_face_style helper that toggles RenderMode (Hidden Line/Shaded/etc.) around a write_image and restores on exit, even on raise."
+  "notes": "v0.5.8 — Live Render preview now shows BOTH input views alongside the AI render. Three-cell grid: Hidden Line (geometry conditioning) · Shaded (material reference) · AI Render output. In single-view mode the geometry cell stays empty so the layout doesn't shift. Click any cell to open the full-size PNG. Tiny corner labels make it obvious which conditioning role each view plays."
 }
