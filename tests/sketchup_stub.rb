@@ -36,10 +36,15 @@ module Sketchup
 
   class ModelStub
     attr_accessor :path, :selection, :pages
+    attr_reader :start_operation_calls, :abort_operation_calls,
+                :commit_operation_calls
     def initialize
       @path = ""
       @selection = []
       @pages = PagesStub.new
+      @start_operation_calls  = 0
+      @abort_operation_calls  = 0
+      @commit_operation_calls = 0
     end
 
     def active_view
@@ -47,6 +52,65 @@ module Sketchup
     end
 
     def entities; []; end
+
+    # v0.6.2 — silent in-memory operations for the segmentation-palette
+    # capture. The plugin uses transparent: true so the recolour never
+    # lands in the user's undo history. The stub just tracks call counts;
+    # tests verify that abort_operation always runs (even on raise).
+    def start_operation(_name, _disable_ui = nil, _next_transparent = nil, _transparent = nil)
+      @start_operation_calls += 1
+      true
+    end
+
+    def abort_operation
+      @abort_operation_calls += 1
+      true
+    end
+
+    def commit_operation
+      @commit_operation_calls += 1
+      true
+    end
+  end
+
+  # ----- Sketchup::Color (v0.6.2) -----
+  # Used by the segmentation-palette helper to repaint materials. Real SU
+  # has Sketchup::Color with .red/.green/.blue and accepts (r,g,b) ints,
+  # an RGB array, or a "#RRGGBB" hex. The minimal stub covers the cases
+  # the plugin actually uses.
+  class Color
+    attr_reader :red, :green, :blue, :alpha
+    def initialize(*args)
+      @alpha = 255
+      case args.length
+      when 1
+        v = args.first
+        if v.is_a?(Array)
+          @red, @green, @blue = v[0].to_i, v[1].to_i, v[2].to_i
+        elsif v.is_a?(String) && v =~ /\A#?([0-9A-Fa-f]{6})\z/
+          h = $1
+          @red   = h[0, 2].to_i(16)
+          @green = h[2, 2].to_i(16)
+          @blue  = h[4, 2].to_i(16)
+        elsif v.is_a?(Color)
+          @red, @green, @blue, @alpha = v.red, v.green, v.blue, v.alpha
+        else
+          @red = @green = @blue = 0
+        end
+      when 3, 4
+        @red   = args[0].to_i
+        @green = args[1].to_i
+        @blue  = args[2].to_i
+        @alpha = args[3].to_i if args[3]
+      else
+        @red = @green = @blue = 0
+      end
+    end
+
+    def to_a; [@red, @green, @blue, @alpha]; end
+    def ==(o); o.is_a?(Color) && o.red == @red && o.green == @green && o.blue == @blue; end
+    alias_method :eql?, :==
+    def hash; [@red, @green, @blue].hash; end
   end
 
   class PagesStub
