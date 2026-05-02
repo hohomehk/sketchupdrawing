@@ -72,13 +72,17 @@ PY
 # Copy injected file to release dir so the auto-update flow can fetch it.
 cp "$TMP_DIR/su_gpt_render.rb" "$OUT_RB"
 
-# Build .rbz with the injected source.
-python3 - "$LOADER" "$TMP_DIR/su_gpt_render.rb" "$OUT_RBZ" <<'PY'
+BRAND_LOGO="$REPO_ROOT/sketchup_plugin/su_gpt_render/brand_logo.png"
+
+# Build .rbz with the injected source + brand assets (logo etc).
+python3 - "$LOADER" "$TMP_DIR/su_gpt_render.rb" "$OUT_RBZ" "$BRAND_LOGO" <<'PY'
 import sys, os, zipfile
-loader_src, plugin_src, out = sys.argv[1:4]
+loader_src, plugin_src, out, brand_logo = sys.argv[1:5]
 with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
     zf.write(loader_src, "su_gpt_render_loader.rb")
     zf.write(plugin_src, "su_gpt_render/su_gpt_render.rb")
+    if os.path.exists(brand_logo):
+        zf.write(brand_logo, "su_gpt_render/brand_logo.png")
 print(f"wrote {out}: {os.path.getsize(out)} bytes")
 PY
 

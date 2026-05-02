@@ -279,7 +279,7 @@ class TestTrayHtml < Minitest::Test
     html = SuGptRender.tray_html
     assert_kind_of String, html
     assert html.include?("<!doctype html>"), "looks like html"
-    assert html.include?("GPT Render"),       "has plugin name"
+    assert html.include?(SuGptRender::PLUGIN_NAME), "has plugin name (#{SuGptRender::PLUGIN_NAME})"
     assert html.include?("v#{SuGptRender::PLUGIN_VERSION}"), "has version"
     assert html.include?("Render Current View"), "has render button"
     assert html.include?("History"), "has history tab"
@@ -1064,7 +1064,7 @@ end
 
 class TestVersionBump < Minitest::Test
   # Single source of truth — bump when releasing.
-  EXPECTED_VERSION = "0.6.3"
+  EXPECTED_VERSION = "0.6.4"
 
   def test_plugin_version_matches_expected
     assert_equal EXPECTED_VERSION, SuGptRender::PLUGIN_VERSION

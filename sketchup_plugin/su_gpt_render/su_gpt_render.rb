@@ -13,8 +13,28 @@ require 'time'
 require 'thread'   # Queue used by Live Stream main↔bg thread handoff
 
 module SuGptRender
-  PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.6.3"
+  PLUGIN_NAME    = "Hohome AI Render"
+  PLUGIN_TAGLINE = "為你屋企添意思 · 訂造傢俬搵好傢俬"
+  # ---- Brand identity (hohomehk.com) ----------------------------------------
+  BRAND_TEAL_DEEP   = "#1a4548"     # primary surface
+  BRAND_TEAL_DARKER = "#0f2f31"     # deeper surface (cards / inputs)
+  BRAND_CREAM       = "#fdd79a"     # accent / highlights
+  BRAND_CREAM_SOFT  = "#f6e7c1"     # softer accent on hover
+  BRAND_TEXT        = "#f4ede0"     # primary text on dark
+  BRAND_TEXT_DIM    = "#c9bfa8"     # secondary text
+  # 300×281 hohomehk white-logo.png loaded from the plugin folder's sibling
+  # PNG. .rbz packages it; the build script copies the source PNG in. We
+  # base64 once at load and cache so the data: URI is reusable inside HTML.
+  BRAND_LOGO_PATH = File.expand_path("brand_logo.png", __dir__)
+  BRAND_LOGO_DATA_URI =
+    if File.exist?(BRAND_LOGO_PATH)
+      "data:image/png;base64,#{Base64.strict_encode64(File.binread(BRAND_LOGO_PATH))}"
+    else
+      nil
+    end
+
+
+  PLUGIN_VERSION = "0.6.4"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -1525,11 +1545,23 @@ module SuGptRender
             invent materials beyond this list.
 
             The "Texture ref" column may say "Image N" — those are TEXTURE
-            SWATCHES uploaded as additional input images (after the 2 view
-            captures). Look at swatch image N to see the actual visual
-            appearance of that material; apply that texture/colour/sheen to
-            the matching region in your render. NEVER include the swatch
-            itself as a scene element — it is reference only.
+            SWATCHES uploaded as additional input images (after the view
+            captures). Each swatch is the RAW source image from the .skp's
+            texture slot — the user may have set an HSL / opacity override
+            on the material so the actual in-scene appearance is "swatch
+            image × HEX colour" with the material's alpha. The HEX in the
+            row tells you the override / tint colour the user set:
+
+              • If swatch dominant tone ≈ HEX → no meaningful tint, render
+                the swatch's natural appearance.
+              • If HEX is clearly different from the swatch's average tone
+                (e.g. swatch is grey concrete, HEX is warm beige) → apply
+                the HEX as a multiply-blend tint over the swatch's pattern.
+              • If a row's hint says "translucent" → render with that
+                translucency (frosted / tinted glass etc.).
+
+            NEVER include the swatch itself as a scene element — it is
+            reference only.
           TBL
         else
           <<~TBL
@@ -1544,11 +1576,23 @@ module SuGptRender
             beyond this list.
 
             The "Texture ref" column may say "Image N" — those are TEXTURE
-            SWATCHES uploaded as additional input images (after the 2 view
-            captures). Look at swatch image N to see the actual visual
-            appearance of that material; apply that texture/colour/sheen to
-            the matching region in your render. NEVER include the swatch
-            itself as a scene element — it is reference only.
+            SWATCHES uploaded as additional input images (after the view
+            captures). Each swatch is the RAW source image from the .skp's
+            texture slot — the user may have set an HSL / opacity override
+            on the material so the actual in-scene appearance is "swatch
+            image × HEX colour" with the material's alpha. The HEX in the
+            row tells you the override / tint colour the user set:
+
+              • If swatch dominant tone ≈ HEX → no meaningful tint, render
+                the swatch's natural appearance.
+              • If HEX is clearly different from the swatch's average tone
+                (e.g. swatch is grey concrete, HEX is warm beige) → apply
+                the HEX as a multiply-blend tint over the swatch's pattern.
+              • If a row's hint says "translucent" → render with that
+                translucency (frosted / tinted glass etc.).
+
+            NEVER include the swatch itself as a scene element — it is
+            reference only.
           TBL
         end
       else
@@ -1875,7 +1919,7 @@ module SuGptRender
     # v0.6.2 — Boost material contrast for the Shaded view. Default OFF;
     # only meaningful when multi_view is on (single-view doesn't use the
     # material-table cross-reference).
-    boost_contrast = (cfg["live_render_boost_contrast"] == true) && multi
+    boost_contrast = (cfg["live_render_boost_contrast"] != false) && multi   # default ON in v0.6.4+
     puts "[GPT Render Live] kick: capturing #{width}x#{height} model=#{model} aspect=#{aspect} multi=#{multi} textures=#{upload_textures} boost=#{boost_contrast}"
 
     raw_paths = nil
@@ -2189,7 +2233,7 @@ module SuGptRender
     liver_aspect    = cfg["live_render_aspect"]      || "1:1"
     liver_keep_raw  = cfg["live_render_keep_raw"]    == true
     liver_multi     = cfg["live_render_multi_view"] != false   # default true
-    liver_boost     = cfg["live_render_boost_contrast"] == true  # default false
+    liver_boost     = cfg["live_render_boost_contrast"] != false   # default ON in v0.6.4+
     liver_model     = cfg["live_render_model"]       || LIVE_RENDER_MODELS.first[0]
     liver_today     = live_render_count_today
     liver_cost      = live_render_cost_today
@@ -2214,24 +2258,29 @@ module SuGptRender
       <!doctype html><html><head><meta charset="utf-8">
       <style>
         * { box-sizing: border-box; }
-        body { margin:0; padding:12px; font-family:-apple-system,"Helvetica Neue","PingFang HK","Microsoft JhengHei",sans-serif; font-size:13px; background:#1d1d1d; color:#ddd; }
-        .head { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
-        .head h1 { margin:0; font-size:14px; font-weight:600; }
-        .head .ver { font-size:11px; opacity:.5; }
+        body { margin:0; padding:12px; font-family:-apple-system,"Helvetica Neue","PingFang HK","Microsoft JhengHei",sans-serif; font-size:13px; background:#{BRAND_TEAL_DEEP}; color:#{BRAND_TEXT}; }
+        .brand { display:flex; align-items:center; gap:10px; padding:10px 4px 14px 4px; border-bottom:1px solid rgba(253,215,154,.15); margin-bottom:10px; }
+        .brand img { width:36px; height:36px; flex-shrink:0; opacity:.95; }
+        .brand .title { font-size:14px; font-weight:600; color:#{BRAND_CREAM}; letter-spacing:.3px; }
+        .brand .tagline { font-size:10.5px; color:#{BRAND_TEXT_DIM}; margin-top:1px; letter-spacing:.4px; }
+        .brand .ver { margin-left:auto; font-size:10px; color:#{BRAND_TEXT_DIM}; opacity:.7; }
+        .head { display:none; }   /* legacy header replaced by .brand */
         .row { margin-bottom:10px; }
-        button { background:#2a2a2a; color:#eee; border:1px solid #3a3a3a; padding:8px 14px; border-radius:5px; cursor:pointer; font-size:13px; }
-        button:hover { background:#353535; border-color:#555; }
-        button.primary { background:#2c80c0; border-color:#2c80c0; color:#fff; font-weight:600; padding:10px 18px; }
-        button.primary:hover { background:#3590d0; }
+        button { background:#{BRAND_TEAL_DARKER}; color:#{BRAND_TEXT}; border:1px solid rgba(253,215,154,.18); padding:8px 14px; border-radius:5px; cursor:pointer; font-size:13px; transition:background .12s,border-color .12s; }
+        button:hover { background:rgba(253,215,154,.08); border-color:rgba(253,215,154,.35); }
+        button.primary { background:#{BRAND_CREAM}; border-color:#{BRAND_CREAM}; color:#{BRAND_TEAL_DEEP}; font-weight:600; padding:10px 18px; }
+        button.primary:hover { background:#{BRAND_CREAM_SOFT}; }
         button.primary:disabled { opacity:.5; cursor:not-allowed; }
         button.small { font-size:11px; padding:5px 9px; }
         .grid { display:grid; grid-template-columns: 1fr 1fr; gap:6px; }
-        input[type=number] { background:#2a2a2a; color:#eee; border:1px solid #3a3a3a; padding:5px 8px; border-radius:4px; width:100%; font-size:13px; }
-        label { display:flex; flex-direction:column; gap:3px; font-size:11px; opacity:.7; }
-        #status { padding:8px 10px; background:#222; border-radius:4px; border-left:3px solid #555; font-size:12px; min-height:18px; margin-bottom:10px; }
-        #status.busy { border-color:#f80; color:#fc6; }
-        #status.ok { border-color:#5c5; color:#cfc; }
-        #status.err { border-color:#c44; color:#fcc; }
+        input[type=number], input[type=text], select, textarea { background:#{BRAND_TEAL_DARKER}; color:#{BRAND_TEXT}; border:1px solid rgba(253,215,154,.18); padding:5px 8px; border-radius:4px; width:100%; font-size:13px; }
+        select { cursor:pointer; }
+        input:focus, select:focus, textarea:focus { outline:none; border-color:#{BRAND_CREAM}; }
+        label { display:flex; flex-direction:column; gap:3px; font-size:11px; color:#{BRAND_TEXT_DIM}; }
+        #status { padding:8px 10px; background:#{BRAND_TEAL_DARKER}; border-radius:4px; border-left:3px solid rgba(253,215,154,.4); font-size:12px; min-height:18px; margin-bottom:10px; color:#{BRAND_TEXT}; }
+        #status.busy { border-color:#{BRAND_CREAM}; color:#{BRAND_CREAM}; }
+        #status.ok { border-color:#7fb86b; color:#bcdda7; }
+        #status.err { border-color:#d97064; color:#f5b6ad; }
         .preview { background:#0a0a0a; border:1px solid #2a2a2a; border-radius:4px; padding:6px; margin-bottom:10px; min-height:120px; position:relative; }
         .preview img { width:100%; display:block; border-radius:3px; cursor:zoom-in; transition:opacity .12s; }
         .preview img:hover { opacity:.85; }
@@ -2245,14 +2294,14 @@ module SuGptRender
         /* sub-tabs (Enhanced/Raw) */
         .tabs { display:flex; gap:4px; margin-bottom:6px; }
         .tabs button { padding:5px 10px; font-size:11px; background:#222; }
-        .tabs button.active { background:#2c80c0; }
+        .tabs button.active { background:#{BRAND_CREAM}; color:#{BRAND_TEAL_DEEP}; }
         /* main top-level tabs (Render/History) */
-        .maintabs { display:flex; gap:0; margin:0 -12px 12px -12px; padding:0 12px; border-bottom:1px solid #2a2a2a; }
-        .maintabs button { background:transparent; border:none; border-bottom:2px solid transparent; padding:9px 14px; color:#888; font-size:13px; font-weight:500; border-radius:0; cursor:pointer; }
-        .maintabs button.active { color:#fff; border-bottom-color:#2c80c0; }
-        .maintabs button:hover:not(.active) { color:#bbb; }
-        .maintabs button .badge { display:inline-block; background:#3a3a3a; color:#bbb; font-size:10px; padding:1px 6px; border-radius:8px; margin-left:6px; }
-        .maintabs button.active .badge { background:#2c80c0; color:#fff; }
+        .maintabs { display:flex; gap:0; margin:0 -12px 12px -12px; padding:0 12px; border-bottom:1px solid rgba(253,215,154,.15); flex-wrap:wrap; }
+        .maintabs button { background:transparent; border:none; border-bottom:2px solid transparent; padding:9px 14px; color:#{BRAND_TEXT_DIM}; font-size:13px; font-weight:500; border-radius:0; cursor:pointer; }
+        .maintabs button.active { color:#{BRAND_CREAM}; border-bottom-color:#{BRAND_CREAM}; }
+        .maintabs button:hover:not(.active) { color:#{BRAND_TEXT}; }
+        .maintabs button .badge { display:inline-block; background:rgba(253,215,154,.18); color:#{BRAND_TEXT_DIM}; font-size:10px; padding:1px 6px; border-radius:8px; margin-left:6px; }
+        .maintabs button.active .badge { background:#{BRAND_CREAM}; color:#{BRAND_TEAL_DEEP}; }
         .pane { display:none; }
         .pane.active { display:block; }
         /* History pane bigger thumbs */
@@ -2309,8 +2358,12 @@ module SuGptRender
         #upd.show { display:block; }
       </style>
       </head><body>
-        <div class="head">
-          <h1>GPT Render</h1>
+        <div class="brand">
+          #{BRAND_LOGO_DATA_URI ? %(<img src="#{BRAND_LOGO_DATA_URI}" alt="Hohome">) : ''}
+          <div>
+            <div class="title">#{PLUGIN_NAME}</div>
+            <div class="tagline">#{PLUGIN_TAGLINE}</div>
+          </div>
           <span class="ver">v#{PLUGIN_VERSION}</span>
         </div>
 
@@ -2529,8 +2582,8 @@ module SuGptRender
             </label>
             <label>Boost material contrast for Shaded view
               <select id="liver_boost" onchange="setLiveRenderBoost()">
-                <option value="0" #{!liver_boost ? 'selected' : ''}>OFF (use real material colours)</option>
-                <option value="1" #{liver_boost  ? 'selected' : ''}>ON (synthetic palette · cleaner segmentation)</option>
+                <option value="1" #{liver_boost  ? 'selected' : ''}>ON ⭐ (synthetic palette · cleaner segmentation · default)</option>
+                <option value="0" #{!liver_boost ? 'selected' : ''}>OFF (use real material colours · for accurate before-after)</option>
               </select>
             </label>
           </div>
@@ -2545,6 +2598,7 @@ module SuGptRender
 
           <div class="small-btns">
             <button class="small" onclick="cmd('edit_live_render_prompt')">Render Prompt</button>
+            <button class="small" onclick="cmd('load_remote_prompt')">📚 Preset library</button>
             <button class="small" onclick="cmd('open_live_render_folder')">Open folder</button>
           </div>
 
@@ -3191,6 +3245,7 @@ module SuGptRender
       push_live_render_materials
     end
     @tray.add_action_callback("edit_live_render_prompt")  { |_, _| edit_live_render_prompt }
+    @tray.add_action_callback("load_remote_prompt")       { |_, _| load_remote_prompt_picker }
     @tray.add_action_callback("open_live_render_folder")  do |_, _|
       dir = history_dir
       if dir
@@ -3537,6 +3592,47 @@ module SuGptRender
     end
     dlg.add_action_callback("cancel") { |_, _| dlg.close }
     dlg.show
+  end
+
+  # Fetch the remote prompt library from the same ngrok-served path that
+  # the auto-update flow uses (sibling to version.json). Lets a designer
+  # pick from a curated set of presets ("Photoreal HK residential",
+  # "Watercolour mood-board", "Minimal Japanese / Muji" etc.) without
+  # having to copy-paste long prompts every time.
+  REMOTE_PROMPT_URL =
+    UPDATE_MANIFEST_URL.to_s.sub(%r{/version\.json$}, "/prompts.json").freeze
+
+  def self.fetch_remote_prompts
+    return [] if REMOTE_PROMPT_URL.empty?
+    res = http_get(REMOTE_PROMPT_URL, attempts: 1) rescue nil
+    return [] unless res.is_a?(Net::HTTPSuccess)
+    data = JSON.parse(res.body) rescue {}
+    Array(data["prompts"]).select { |p| p.is_a?(Hash) && p["body"] }
+  end
+
+  def self.load_remote_prompt_picker
+    prompts = fetch_remote_prompts
+    if prompts.empty?
+      UI.messagebox("No remote prompts available.\n\n" \
+                    "(Tried: #{REMOTE_PROMPT_URL})\n\n" \
+                    "If you're the operator, edit the prompts.json on the\n" \
+                    "local server and refresh.")
+      return
+    end
+    labels = prompts.map.with_index(1) { |p, i|
+      "#{i}. #{p['label'] || p['id']} — #{(p['description'] || '')[0,80]}"
+    }
+    msg = "Remote preset library\n\n" + labels.join("\n") +
+          "\n\nEnter the number of the preset you want to load:"
+    res = UI.inputbox(["Preset #"], ["1"], msg)
+    return unless res
+    idx = (res.is_a?(Array) ? res[0] : res).to_i - 1
+    return unless idx >= 0 && idx < prompts.length
+    chosen = prompts[idx]
+    cfg = load_config
+    cfg["live_render_prompt"] = chosen["body"].to_s
+    save_config(cfg)
+    push_status("Loaded preset: #{chosen['label'] || chosen['id']}", "ok")
   end
 
   # Live Render prompt editor. Defaults to DEFAULT_LIVE_RENDER_PROMPT — this
