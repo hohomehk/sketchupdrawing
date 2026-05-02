@@ -34,7 +34,7 @@ module SuGptRender
     end
 
 
-  PLUGIN_VERSION = "0.6.4"
+  PLUGIN_VERSION = "0.6.5"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -2921,14 +2921,15 @@ module SuGptRender
     items.map { |t|
       tag = t["source"] == "builtin" ? "<span class='tag builtin'>built-in</span>" : "<span class='tag user'>my</span>"
       preview = CGI.escapeHTML(t["prompt"][0,90]).gsub("\n", " ")
-      del_btn = t["source"] == "user" ? "<button class='small danger' onclick=\"deleteTpl(#{t['id'].to_json})\" title='Delete'>×</button>" : ""
+      tid_arg = CGI.escapeHTML(t['id'].to_json)
+      del_btn = t["source"] == "user" ? "<button class='small danger' onclick=\"deleteTpl(#{tid_arg})\" title='Delete'>×</button>" : ""
       <<~HTML
         <div class="tpl-item">
           <div class="tpl-meta">
             <div class="tpl-name">#{tag} #{CGI.escapeHTML(t['name'])}</div>
             <div class="tpl-preview">#{preview}…</div>
           </div>
-          <button class='small' onclick="useTpl(#{t['id'].to_json})">Use</button>
+          <button class='small' onclick="useTpl(#{tid_arg})">Use</button>
           #{del_btn}
         </div>
       HTML
@@ -2945,7 +2946,7 @@ module SuGptRender
       time_label = ts.length >= 16 ? ts[11,8] : ts
       <<~HTML
         <div class='aiw-item'>
-          <img src="#{img_url}" onclick="sketchup.open_file(#{img_path.to_json})">
+          <img src="#{img_url}" onclick="sketchup.open_file(#{CGI.escapeHTML(img_path.to_json)})">
           <div class='aiw-meta'>
             <div class='aiw-when'>#{time_label} <span class='model'>#{CGI.escapeHTML(o['model'].to_s)}</span> <span class='dim'>#{o['elapsed_sec']}s</span></div>
             <div class='aiw-text'>#{CGI.escapeHTML(o['text'].to_s).gsub("\n", '<br>')}</div>
@@ -3135,7 +3136,23 @@ module SuGptRender
       style:           UI::HtmlDialog::STYLE_UTILITY
     )
     @tray.set_html(tray_html)
+    attach_tray_callbacks
+    @tray.show
+    schedule_material_poll
 
+    # Background auto-update — schedule via UI.start_timer ON MAIN THREAD.
+    @initial_update_timer = UI.start_timer(2.0, false) { kick_auto_update }
+    @recurring_update_timer ||= UI.start_timer(600, true) { kick_auto_update }
+  end
+
+  # Re-callable callback binding. The HtmlDialog object survives hot-reload
+  # (we keep @tray via ||= and use set_html for in-place refresh), but its
+  # action_callback table needs to be re-attached so action callbacks added
+  # in a newer version of the .rb actually wire up. add_action_callback with
+  # an existing name simply replaces the old block, so calling this twice on
+  # the same tray is safe.
+  def self.attach_tray_callbacks
+    return unless @tray
     @tray.add_action_callback("render") do |_, opts_json|
       begin
         opts = JSON.parse(opts_json)
@@ -3276,13 +3293,10 @@ module SuGptRender
     @tray.add_action_callback("check_update")    { |_, _| check_update(true) }
     @tray.add_action_callback("download_update") { |_, _| download_update }
     @tray.add_action_callback("open_folder")     { |_, _| open_output_folder }
+  end
 
-    @tray.show
-
-    # Live Render material panel: prime once on tray-open, then poll every 5s
-    # so user sees what materials Gemini will see when they switch component
-    # / change selection / edit materials. Cheap (just a tree-walk + JSON
-    # serialization, no HTTP). The timer survives load __FILE__ via @ivar.
+  # Material-panel polling tick. Extracted so hot-reload can call it.
+  def self.schedule_material_poll
     push_live_render_materials
     if @liverender_material_timer
       UI.stop_timer(@liverender_material_timer) rescue nil
@@ -3290,13 +3304,6 @@ module SuGptRender
     @liverender_material_timer = UI.start_timer(5.0, true) {
       push_live_render_materials rescue nil
     }
-
-    # Background auto-update — schedule via UI.start_timer ON MAIN THREAD.
-    # (Calling UI.start_timer FROM a background Thread is unreliable in SU;
-    # the timer block never fires. So we keep all timer scheduling on main
-    # thread, and only do the actual HTTP work inside a Thread we poll.)
-    @initial_update_timer = UI.start_timer(2.0, false) { kick_auto_update }
-    @recurring_update_timer ||= UI.start_timer(600, true) { kick_auto_update }
   end
 
   # Spawn a Ruby Thread to do the (slow) HTTP version check, then poll the
@@ -3493,10 +3500,16 @@ module SuGptRender
       tlabel = ts.length >= 16 ? ts[11,8] : ts
       tokens = it[:tokens].to_i
       tooltip = "#{tlabel} · #{tokens} tokens · #{it[:elapsed]}s"
+      # CRITICAL: render_url.to_json contains double quotes, and the onclick=
+      # attribute is double-quoted too — without HTML-escaping the inner JSON
+      # the browser parses `onclick="sketchup.open_url("file...")"` as a
+      # broken/empty handler and the click does nothing. CGI.escapeHTML
+      # converts the inner " to &quot; so the attribute parses cleanly.
+      js_arg = CGI.escapeHTML(render_url.to_json)
       <<~HTML
-        <div style="flex:0 0 auto;display:flex;flex-direction:column;align-items:center;gap:4px;background:#222;padding:6px;border-radius:4px;">
-          <img src="#{render_url}" style="width:96px;height:96px;object-fit:cover;border-radius:3px;cursor:pointer;" onclick="sketchup.open_url(#{render_url.to_json})" title="#{CGI.escapeHTML(tooltip)}">
-          <div style="font-size:10px;opacity:.6;">#{tlabel}</div>
+        <div style="flex:0 0 auto;display:flex;flex-direction:column;align-items:center;gap:4px;background:#0f2f31;padding:6px;border-radius:4px;border:1px solid rgba(253,215,154,.18);">
+          <img src="#{render_url}" style="width:96px;height:96px;object-fit:cover;border-radius:3px;cursor:pointer;" onclick="sketchup.open_url(#{js_arg})" title="#{CGI.escapeHTML(tooltip)}">
+          <div style="font-size:10px;color:#c9bfa8;">#{tlabel}</div>
         </div>
       HTML
     }.join("\n")
@@ -4080,14 +4093,18 @@ module SuGptRender
       @tray = saved_tray
 
       # Refresh the tray IN PLACE via set_html. The live HtmlDialog stays
-      # open, action_callbacks already registered are late-bound to method
-      # names so they auto-resolve to the new code. No flicker, no close.
+      # open, EXISTING action_callbacks are late-bound to method names so
+      # they auto-resolve to the new code. But action_callbacks ADDED in
+      # the new version (e.g. v0.6.4 added load_remote_prompt) are only
+      # bound on dialog creation — set_html alone doesn't re-attach them.
+      # So we re-run attach_tray_callbacks after each hot-reload. SU's
+      # add_action_callback replaces by name, so re-attach is idempotent
+      # for existing callbacks and registers any new ones.
       if @tray && @tray.visible?
         begin
           @tray.set_html(tray_html)
+          attach_tray_callbacks
         rescue => e
-          # If set_html-on-shown-dialog fails on this SU version, fall back
-          # to close+reopen.
           @tray.close
           @tray = nil
           UI.start_timer(0.2, false) { show_tray rescue nil }
