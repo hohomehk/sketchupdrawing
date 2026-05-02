@@ -14,7 +14,7 @@ require 'thread'   # Queue used by Live Stream main↔bg thread handoff
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.5.6"
+  PLUGIN_VERSION = "0.5.7"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -420,7 +420,9 @@ module SuGptRender
   # parses the markdown image URL out of the response, downloads it next to
   # the input PNG. Returns [output_path, completion_tokens] so the cost meter
   # can use the per-model rate from LIVE_RENDER_MODELS.
-  def self.call_poe_image_for_live_render(input_image_path, prompt, live_render_id)
+  def self.call_poe_image_for_live_render(input_image_paths, prompt, live_render_id)
+    paths = Array(input_image_paths)   # accept either a single path or [geom, material]
+    raise "no input images" if paths.empty?
     cfg = load_config
     api_key = cfg["poe_api_key"].to_s
     raise "Poe API key missing — set it in tray Render tab" if api_key.empty?
@@ -432,20 +434,44 @@ module SuGptRender
                 else live_render_id
                 end
 
-    # Build the same payload call_poe builds, but capture usage too — call_poe
-    # only returns the URL, so we duplicate the request body here.
-    img_b64 = Base64.strict_encode64(File.binread(input_image_path))
+    # Multi-view: prepend a structural-conditioning preamble before the user
+    # prompt so the model treats each image with the right role. Single-view
+    # falls through to the original prompt.
+    final_prompt = if paths.length >= 2
+      <<~MULTI
+        You are receiving #{paths.length} views of the SAME 3D scene from the
+        SAME camera. Treat each view as a different conditioning signal:
+
+          • Image 1 (HIDDEN-LINE wireframe): EXACT geometry constraint. Every
+            edge, corner, and panel division in this image MUST appear in
+            your output — do NOT smooth, round, merge, or invent geometry.
+          • Image 2 (SHADED with materials): use ONLY for material / colour
+            assignment. Geometry is locked by Image 1; do not extract layout
+            from this view.
+        #{paths.length >= 3 ? "  • Image 3 (MONOCHROME shape): supplementary 3-D shape reference.\n" : ""}
+        Your render must combine: Image 1's geometry + Image 2's materials +
+        the user's stylistic instruction below.
+
+        ====== USER INSTRUCTION ======
+        #{prompt}
+      MULTI
+    else
+      prompt
+    end
+
+    content_arr = [{ "type" => "text", "text" => final_prompt }]
+    paths.each do |p|
+      img_b64 = Base64.strict_encode64(File.binread(p))
+      content_arr << {
+        "type" => "image_url",
+        "image_url" => { "url" => "data:image/png;base64,#{img_b64}" }
+      }
+    end
+
     payload = {
       "model"    => poe_model,
-      "messages" => [{
-        "role" => "user",
-        "content" => [
-          { "type" => "text", "text" => prompt },
-          { "type" => "image_url",
-            "image_url" => { "url" => "data:image/png;base64,#{img_b64}" } }
-        ]
-      }],
-      "stream" => false,
+      "messages" => [{ "role" => "user", "content" => content_arr }],
+      "stream"   => false,
     }
     res = http_post_json(POE_ENDPOINT,
       { "Authorization" => "Bearer #{api_key}", "Content-Type" => "application/json" },
@@ -458,9 +484,10 @@ module SuGptRender
     raise "Poe returned no image URL: #{content[0,300]}" unless url_match
     img_url = url_match[1]
 
-    # Save next to input.
-    in_dir = File.dirname(input_image_path)
-    base = File.basename(input_image_path, ".*")
+    # Save next to first input.
+    primary = paths.first
+    in_dir = File.dirname(primary)
+    base = File.basename(primary, ".*").sub(/_lr_(geom|raw|material)$/, "_lr")
     out_path = File.join(in_dir, "#{base}_render.png")
     download(img_url, out_path)
 
@@ -502,18 +529,42 @@ module SuGptRender
   #     emits zero candidate text (root cause of the empty-Live-Stream bug).
   #   - maxOutputTokens=1024 caps the visible response. Live Stream feedback
   #     should be brief; the user can re-ask for more detail.
-  def self.build_gemini_payload(image_path, prompt, model: "gemini-2.5-flash",
+  def self.build_gemini_payload(image_path_or_paths, prompt,
+                                model: "gemini-2.5-flash",
                                 mime_type: "image/jpeg", max_output_tokens: 1024,
                                 aspect_ratio: nil)
-    img_b64 = Base64.strict_encode64(File.binread(image_path))
-    body = {
-      "contents" => [{
-        "parts" => [
-          { "inlineData" => { "mimeType" => mime_type, "data" => img_b64 } },
-          { "text" => prompt },
-        ]
-      }],
+    paths = Array(image_path_or_paths)
+    raise "no input images" if paths.empty?
+    parts = paths.map { |p|
+      img_b64 = Base64.strict_encode64(File.binread(p))
+      { "inlineData" => { "mimeType" => mime_type, "data" => img_b64 } }
     }
+
+    # Multi-view conditioning preamble (same content as Poe path so the two
+    # providers behave identically when fed the same captures).
+    final_prompt = if paths.length >= 2
+      <<~MULTI
+        You are receiving #{paths.length} views of the SAME 3D scene from the
+        SAME camera. Treat each view as a different conditioning signal:
+
+          • Image 1 (HIDDEN-LINE wireframe): EXACT geometry constraint. Every
+            edge, corner, and panel division MUST appear in your output — do
+            NOT smooth, round, merge, or invent geometry.
+          • Image 2 (SHADED with materials): use ONLY for material / colour
+            assignment. Geometry is locked by Image 1.
+
+        Your render = Image 1's geometry + Image 2's materials + the user
+        instruction below.
+
+        ====== USER INSTRUCTION ======
+        #{prompt}
+      MULTI
+    else
+      prompt
+    end
+
+    parts << { "text" => final_prompt }
+    body = { "contents" => [{ "parts" => parts }] }
     # Image-output models (gemini-2.5-flash-image et al.) do NOT accept
     # thinkingConfig and need their full token budget (~1290 tokens per
     # 1024² PNG). Skip both knobs entirely for them but DO accept
@@ -569,12 +620,13 @@ module SuGptRender
   # Response shape:
   #   candidates[0].content.parts[*].inlineData.data → base64 PNG output
   #   usageMetadata.candidatesTokensDetails[].tokenCount where modality=IMAGE
-  def self.call_gemini_image(input_image_path, prompt,
+  def self.call_gemini_image(input_image_path_or_paths, prompt,
                              model: "gemini-2.5-flash-image",
                              input_mime: "image/png",
                              aspect_ratio: nil)
+    paths = Array(input_image_path_or_paths)
     url = "#{GEMINI_AIG_URL}/v1beta/models/#{model}:generateContent"
-    payload = build_gemini_payload(input_image_path, prompt,
+    payload = build_gemini_payload(paths, prompt,
                                    model: model, mime_type: input_mime,
                                    aspect_ratio: aspect_ratio)
     res = http_post_json(url, gemini_aig_headers, JSON.generate(payload))
@@ -589,10 +641,11 @@ module SuGptRender
     b64 = img_part["inlineData"]["data"].to_s
     out_bytes = Base64.decode64(b64)
 
-    # Choose an output path next to the input (e.g. live_render dir),
-    # falling back to ~/Desktop if input has no usable directory.
-    in_dir = File.dirname(input_image_path)
-    base = File.basename(input_image_path, ".*")
+    # Output goes next to the FIRST input. Strip any role-suffix from the
+    # name so we don't end up with "..._lr_geom_render.png".
+    primary = paths.first
+    in_dir = File.dirname(primary)
+    base = File.basename(primary, ".*").sub(/_lr_(geom|raw|material)$/, "_lr")
     out_path = File.join(in_dir, "#{base}_render.png")
     File.binwrite(out_path, out_bytes)
 
@@ -1197,7 +1250,7 @@ module SuGptRender
   # JPEG) because gemini-2.5-flash-image happily accepts both and PNG keeps
   # SketchUp lines crisp (the ~3MB cost of an extra-quality input is fine
   # given the model latency dominates).
-  def self.export_view_for_live_render(width, height)
+  def self.export_view_for_live_render(width, height, multi_view: false)
     model = Sketchup.active_model
     raise "No model" unless model
     base = model.path.empty? ? "Untitled" : File.basename(model.path, ".skp")
@@ -1209,20 +1262,64 @@ module SuGptRender
                 File.join(File.dirname(model.path), "gpt_render", "live_render")
               end
     FileUtils.mkdir_p(out_dir)
-    out_path = File.join(out_dir, "#{timestamp}_#{base}_lr_raw.png")
 
-    # Snapshot the user's lighting + view options so we can restore them after
-    # capture. SU's default rendering shades faces by their normal vs the sun
-    # angle, so a pure-white wall reads as light-grey when angled away — and
-    # Gemini interprets that grey as the actual material color in its render.
-    # Disable sun-shading + shadows for the capture window, then restore.
-    with_flat_lighting(model) do
-      success = model.active_view.write_image(filename: out_path, width: width,
-                                              height: height, antialias: true,
-                                              transparent: false)
-      raise "write_image failed" unless success
+    write_one = ->(suffix, style) {
+      out = File.join(out_dir, "#{timestamp}_#{base}_lr_#{suffix}.png")
+      with_face_style(model, style) do
+        with_flat_lighting(model) do
+          ok = model.active_view.write_image(filename: out, width: width,
+                                             height: height, antialias: true,
+                                             transparent: false)
+          raise "write_image #{suffix} failed" unless ok
+        end
+      end
+      out
+    }
+
+    if multi_view
+      # 2-pass capture for multi-image conditioning: Hidden Line for pure
+      # geometry constraint, Shaded with Texture for material/colour. We
+      # deliberately skip Monochrome — adds tokens without much extra signal
+      # for diffusion models.
+      [
+        write_one.("geom",     "hidden_line"),
+        write_one.("material", "shaded_with_texture"),
+      ]
+    else
+      [write_one.("raw", "shaded_with_texture")]
     end
-    out_path
+  end
+
+  # Temporarily set RenderMode (face style) for the active view, restore on
+  # exit. Used to capture multiple views of the same scene in different
+  # styles for multi-image conditioning. RenderMode integer values vary by
+  # SU version, so the caller passes a name we map locally; unknown names
+  # fall through to a no-op restore-only.
+  RENDER_MODES = {
+    "wireframe"          => 0,
+    "hidden_line"        => 1,
+    "shaded"             => 2,
+    "shaded_with_texture"=> 3,
+    "monochrome"         => 4,
+    "xray"               => 5,
+  }.freeze
+
+  def self.with_face_style(model, style_name)
+    ro = model.rendering_options rescue nil
+    saved = (ro["RenderMode"] rescue nil)
+    target = RENDER_MODES[style_name]
+    if ro && target
+      ro["RenderMode"] = target rescue nil
+      model.active_view.refresh rescue nil
+    end
+    begin
+      yield
+    ensure
+      if ro && !saved.nil?
+        ro["RenderMode"] = saved rescue nil
+        model.active_view.refresh rescue nil
+      end
+    end
   end
 
   # Temporarily flatten SU's lighting so a capture writes flat material colours
@@ -1327,17 +1424,19 @@ module SuGptRender
     width  = (cfg["live_render_width"]  || 1024).to_i
     height = (cfg["live_render_height"] || 1024).to_i
     aspect = cfg["live_render_aspect"] || "1:1"   # 1:1, 16:9, 9:16, 4:3, 3:4
-    puts "[GPT Render Live] kick: capturing #{width}x#{height} model=#{model} aspect=#{aspect}"
+    multi  = cfg["live_render_multi_view"] != false   # default ON in v0.5.7+
+    puts "[GPT Render Live] kick: capturing #{width}x#{height} model=#{model} aspect=#{aspect} multi=#{multi}"
 
-    raw_path = nil
+    raw_paths = nil
     begin
-      raw_path = export_view_for_live_render(width, height)
-      puts "[GPT Render Live] capture OK: #{raw_path}"
+      raw_paths = export_view_for_live_render(width, height, multi_view: multi)
+      puts "[GPT Render Live] capture OK: #{raw_paths.length} view(s) → #{raw_paths.map { |p| File.basename(p) }.join(', ')}"
     rescue => e
       puts "[GPT Render Live] capture FAIL: #{e.class}: #{e.message}"
       push_live_render_status("Capture failed: #{e.message}", "err")
       return
     end
+    raw_path = raw_paths.last   # show the shaded view (more visually informative) in the UI cell
     push_live_render_frame(raw_path, nil)
     @liverender[:in_flight] = true
     push_live_render_status("Rendering (#{model}) ~10s…", "busy")
@@ -1355,22 +1454,22 @@ module SuGptRender
         end
         render_path, tokens =
           if provider == :poe
-            call_poe_image_for_live_render(raw_path, prompt, model)
+            call_poe_image_for_live_render(raw_paths, prompt, model)
           else
-            call_gemini_image(raw_path, prompt,
+            call_gemini_image(raw_paths, prompt,
                               model: model,
                               input_mime: "image/png",
                               aspect_ratio: aspect)
           end
         elapsed = (Time.now - started).round(1)
         puts "[GPT Render Live] render OK (#{provider}): #{render_path} (#{tokens} tokens, #{elapsed}s)"
-        # Default: drop the raw SU view we just sent — only the AI render is
-        # interesting to keep. Set live_render_keep_raw=true in config to
-        # retain both for debugging / before-after comparison.
+        # Default: drop ALL raw SU views we just sent (geom + material + …).
+        # Only the AI render is interesting to keep. Set live_render_keep_raw=
+        # true to retain them for debugging / before-after comparison.
         keep_raw = (load_config["live_render_keep_raw"] == true) rescue false
-        if !keep_raw && raw_path && File.exist?(raw_path)
-          File.delete(raw_path) rescue nil
-          raw_path = nil  # so push_live_render_frame doesn't try to display a deleted file
+        if !keep_raw
+          raw_paths.each { |p| File.delete(p) rescue nil if p && File.exist?(p) }
+          raw_path = nil  # so push_live_render_frame doesn't try to display deleted files
         end
         # Drop the result if user hit Stop while we were rendering — don't
         # push stale frames into a paused tab.
@@ -1602,6 +1701,7 @@ module SuGptRender
     liver_resolution = (cfg["live_render_width"]      || 1024).to_i
     liver_aspect    = cfg["live_render_aspect"]      || "1:1"
     liver_keep_raw  = cfg["live_render_keep_raw"]    == true
+    liver_multi     = cfg["live_render_multi_view"] != false   # default true
     liver_model     = cfg["live_render_model"]       || LIVE_RENDER_MODELS.first[0]
     liver_today     = live_render_count_today
     liver_cost      = live_render_cost_today
@@ -1929,6 +2029,12 @@ module SuGptRender
             </label>
           </div>
           <div class="grid row">
+            <label>Multi-view conditioning (reduces hallucination)
+              <select id="liver_multi" onchange="setLiveRenderMulti()">
+                <option value="1" #{liver_multi  ? 'selected' : ''}>2 views: Hidden-Line + Shaded ⭐ (recommended)</option>
+                <option value="0" #{!liver_multi ? 'selected' : ''}>1 view: Shaded only (legacy / faster)</option>
+              </select>
+            </label>
             <label>Keep raw captures
               <select id="liver_keep_raw" onchange="setLiveRenderKeepRaw()">
                 <option value="0" #{!liver_keep_raw ? 'selected' : ''}>No (auto-delete after render)</option>
@@ -2113,6 +2219,7 @@ module SuGptRender
         function setLiveRenderResolution(){ sketchup.set_live_render_resolution(document.getElementById('liver_resolution').value); }
         function setLiveRenderAspect()    { sketchup.set_live_render_aspect(document.getElementById('liver_aspect').value); }
         function setLiveRenderKeepRaw()   { sketchup.set_live_render_keep_raw(document.getElementById('liver_keep_raw').value); }
+        function setLiveRenderMulti()     { sketchup.set_live_render_multi(document.getElementById('liver_multi').value); }
         function setLiveRenderUI(enabled) {
           const btn  = document.getElementById('liver_btn');
           const dot  = document.getElementById('liver_dot');
@@ -2540,6 +2647,9 @@ module SuGptRender
     end
     @tray.add_action_callback("set_live_render_keep_raw") do |_, v|
       cfg = load_config; cfg["live_render_keep_raw"] = (v.to_s == "1"); save_config(cfg)
+    end
+    @tray.add_action_callback("set_live_render_multi") do |_, v|
+      cfg = load_config; cfg["live_render_multi_view"] = (v.to_s == "1"); save_config(cfg)
     end
     @tray.add_action_callback("edit_live_render_prompt")  { |_, _| edit_live_render_prompt }
     @tray.add_action_callback("open_live_render_folder")  do |_, _|

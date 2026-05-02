@@ -1,5 +1,5 @@
 {
-  "version": "0.5.6",
+  "version": "0.5.7",
   "rb_url": "https://hohomehk-plugin.ngrok.app/su_gpt_render.rb",
-  "notes": "v0.5.6 — Live Render gets a model dropdown with 4 cost-tiered options. New default is Nano-Banana via Poe at $0.0023/render (HK$0.018), 17× cheaper than the previous CF AI Gateway path. Pricing observed empirically: Poe charges per-token at unified text rate, while Google direct charges $30/M (2.5 image) or $120/M (3-pro image) for image-output tokens. Privacy caveat: Poe-rendered images live on pfst.cf2.poecdn.net for hours-days; pick a CF Gateway option (gemini-2.5-flash-image / gemini-3-pro-image-preview) for confidential client work. UI now shows per-render cost in both USD and HKD next to the model name."
+  "notes": "v0.5.7 — Multi-view conditioning to fight diffusion-model hallucination. Each Live Render tick now (by default) captures TWO SU views: a HIDDEN-LINE wireframe locking exact geometry, and a SHADED-WITH-TEXTURES capture for material/colour reference. Both go into the same generateContent call with a role-tagged preamble: 'Image 1 = exact geometry constraint; Image 2 = materials only.' Diffusion models follow this much better than a single image + long negative prompt. UI dropdown lets you fall back to single-view if you want lower latency. Works on both Poe and CF Gateway paths. Adds with_face_style helper that toggles RenderMode (Hidden Line/Shaded/etc.) around a write_image and restores on exit, even on raise."
 }
