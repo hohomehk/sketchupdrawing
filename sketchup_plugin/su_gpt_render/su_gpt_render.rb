@@ -14,7 +14,7 @@ require 'thread'   # Queue used by Live Stream main↔bg thread handoff
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.5.0"
+  PLUGIN_VERSION = "0.5.1"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -1119,7 +1119,10 @@ module SuGptRender
   end
 
   def self.start_live_render
-    return if @liverender[:enabled]
+    if @liverender[:enabled]
+      puts "[GPT Render Live] start: already enabled — ignoring"
+      return
+    end
     @liverender[:enabled]    = true
     @liverender[:stop_flag]  = false
     @liverender[:queue]      = Queue.new
@@ -1128,19 +1131,20 @@ module SuGptRender
     interval = (cfg["live_render_interval"] || 10).to_i.clamp(5, 600)
 
     push_live_render_state(true)
-    push_live_render_status("Live Render: ON (#{interval}s)", "ok")
+    push_live_render_status("Live Render: ON (#{interval}s) — first frame in ~1s", "ok")
+    puts "[GPT Render Live] start: enabled=true interval=#{interval}s"
 
     # Drain queue from main thread.
     @liverender[:poll_timer] = UI.start_timer(0.2, true) { drain_live_render_queue }
 
-    # Tick: kick the first frame ~immediately, then every `interval` seconds.
-    @liverender[:tick_timer] = UI.start_timer(0.05, true) do
-      if !@liverender[:in_flight] && @liverender[:enabled]
-        kick_live_render_frame
-        UI.stop_timer(@liverender[:tick_timer]) if @liverender[:tick_timer]
-        @liverender[:tick_timer] = UI.start_timer(interval, true) do
-          kick_live_render_frame if !@liverender[:in_flight] && @liverender[:enabled]
-        end
+    # Kick the first frame directly (no 0.05s indirection — was too short
+    # under SU's timer scheduler). Then re-arm a recurring `interval` timer.
+    UI.start_timer(0.5, false) do
+      puts "[GPT Render Live] first-tick fired (enabled=#{@liverender[:enabled]} in_flight=#{@liverender[:in_flight]})"
+      kick_live_render_frame if @liverender[:enabled] && !@liverender[:in_flight]
+      @liverender[:tick_timer] = UI.start_timer(interval, true) do
+        puts "[GPT Render Live] recurring-tick fired (enabled=#{@liverender[:enabled]} in_flight=#{@liverender[:in_flight]})"
+        kick_live_render_frame if @liverender[:enabled] && !@liverender[:in_flight]
       end
     end
     puts "[GPT Render] Live Render started"
@@ -1169,24 +1173,32 @@ module SuGptRender
   end
 
   def self.kick_live_render_frame
-    return unless @liverender[:enabled]
-    return if @liverender[:in_flight]
+    unless @liverender[:enabled]
+      puts "[GPT Render Live] kick: not enabled, skip"; return
+    end
+    if @liverender[:in_flight]
+      puts "[GPT Render Live] kick: in_flight, skip"; return
+    end
     cfg = load_config
     prompt = cfg["live_render_prompt"] || DEFAULT_LIVE_RENDER_PROMPT
     model  = cfg["live_render_model"]  || LIVE_RENDER_MODELS.first[0]
     width  = (cfg["live_render_width"]  || 1024).to_i
     height = (cfg["live_render_height"] || 1024).to_i
+    puts "[GPT Render Live] kick: capturing #{width}x#{height} model=#{model}"
 
     raw_path = nil
     begin
       raw_path = export_view_for_live_render(width, height)
+      puts "[GPT Render Live] capture OK: #{raw_path}"
     rescue => e
+      puts "[GPT Render Live] capture FAIL: #{e.class}: #{e.message}"
       push_live_render_status("Capture failed: #{e.message}", "err")
       return
     end
     push_live_render_frame(raw_path, nil)
     @liverender[:in_flight] = true
     push_live_render_status("Rendering (#{model}) ~10s…", "busy")
+    puts "[GPT Render Live] kick: bg thread starting…"
 
     @liverender[:bg_thread] = Thread.new do
       q = @liverender[:queue]
@@ -1201,6 +1213,7 @@ module SuGptRender
                                                 model: model,
                                                 input_mime: "image/png")
         elapsed = (Time.now - started).round(1)
+        puts "[GPT Render Live] render OK: #{render_path} (#{tokens} tokens, #{elapsed}s)"
         # Drop the result if user hit Stop while we were rendering — don't
         # push stale frames into a paused tab.
         if @liverender[:stop_flag]
@@ -1217,7 +1230,9 @@ module SuGptRender
           ts:          Time.now.iso8601,
         }] if q
       rescue => e
-        q << [:err, e.message] if q
+        puts "[GPT Render Live] render FAIL: #{e.class}: #{e.message[0,300]}"
+        puts e.backtrace.first(3).join("\n  ")
+        q << [:err, "#{e.class}: #{e.message}"] if q
       ensure
         q << [:flight_done, nil] if q
       end
