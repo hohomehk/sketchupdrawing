@@ -58,3 +58,7 @@ releases/su_gpt_render.rb
 # inside the ruby source it bundles. Goes to local hohome-plugin-update.service
 # served at https://hohomehk-plugin.ngrok.app, NOT to GitHub.
 releases/su_gpt_render.rbz
+
+# E2E test outputs — generated each run from real Gemini calls
+tests/e2e-frame_render.png
+tests/e2e-rendered.png
