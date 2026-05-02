@@ -1,5 +1,5 @@
 {
-  "version": "0.5.8",
+  "version": "0.5.9",
   "rb_url": "https://hohomehk-plugin.ngrok.app/su_gpt_render.rb",
-  "notes": "v0.5.8 — Live Render preview now shows BOTH input views alongside the AI render. Three-cell grid: Hidden Line (geometry conditioning) · Shaded (material reference) · AI Render output. In single-view mode the geometry cell stays empty so the layout doesn't shift. Click any cell to open the full-size PNG. Tiny corner labels make it obvious which conditioning role each view plays."
+  "notes": "v0.5.9 — fix Live Render preview cell mis-assignment introduced in 0.5.8. push_live_render_frame had a backward-compat branch that triggered whenever the third arg was nil; the multi-view kick called it with (geom, shaded, nil) before the bg thread finished, which incorrectly shuffled the args (geom PNG ended up in the Shaded cell, etc.). Removed the legacy 2-arg form entirely — all callers now pass three explicit args. Hidden Line cell now actually shows the Hidden-Line capture; Shaded cell shows the Shaded capture."
 }

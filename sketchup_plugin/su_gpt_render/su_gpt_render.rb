@@ -14,7 +14,7 @@ require 'thread'   # Queue used by Live Stream main↔bg thread handoff
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.5.8"
+  PLUGIN_VERSION = "0.5.9"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -2834,29 +2834,21 @@ module SuGptRender
     push_status(msg, cls)
   end
 
-  # Push captured views + render to the tray. Multi-view captures pass
-  # geom_path (Hidden Line) AND shaded_path (Shaded with Textures); single-
-  # view callers pass nil for geom and the lone capture as shaded.
-  def self.push_live_render_frame(geom_path_or_legacy_raw, render_path_or_shaded_path = nil, render_path = nil)
+  # Push captured views + render to the tray. Always 3 explicit args:
+  #   geom_path    Hidden-Line capture (nil in single-view mode)
+  #   shaded_path  Shaded-with-Texture capture
+  #   render_path  AI render output (nil before bg thread completes)
+  # Any of the three may be nil; the JS side only updates non-null cells.
+  # The previous (raw, render) 2-arg form was dropped — it broke when the
+  # 3-arg call passed nil as render_path because the optional-arg default
+  # collapsed into the legacy branch and shuffled the cells out of order.
+  def self.push_live_render_frame(geom_path, shaded_path, render_path)
     return unless @tray && @tray.visible?
-    # Backward-compat: old callers do push_live_render_frame(raw, render).
-    # New (multi-view) callers do push_live_render_frame(geom, shaded, render).
-    if render_path.nil?
-      # Old 2-arg form: arg1 = single capture (treated as shaded), arg2 = render.
-      geom_path   = nil
-      shaded_path = geom_path_or_legacy_raw
-      render_path = render_path_or_shaded_path
-    else
-      geom_path   = geom_path_or_legacy_raw
-      shaded_path = render_path_or_shaded_path
-    end
     to_url = ->(p) { p ? "file://" + p.gsub("\\", "/") : nil }
-    geom_url, shaded_url, render_url =
-      to_url.call(geom_path), to_url.call(shaded_path), to_url.call(render_path)
     js = "setLiveRenderFrames(" \
-         "#{geom_url   ? geom_url.to_json   : 'null'}, " \
-         "#{shaded_url ? shaded_url.to_json : 'null'}, " \
-         "#{render_url ? render_url.to_json : 'null'})"
+         "#{(u = to_url.call(geom_path))   ? u.to_json : 'null'}, " \
+         "#{(u = to_url.call(shaded_path)) ? u.to_json : 'null'}, " \
+         "#{(u = to_url.call(render_path)) ? u.to_json : 'null'})"
     @tray.execute_script(js)
   end
 
