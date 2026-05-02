@@ -14,7 +14,7 @@ require 'thread'   # Queue used by Live Stream main↔bg thread handoff
 
 module SuGptRender
   PLUGIN_NAME    = "GPT Render"
-  PLUGIN_VERSION = "0.5.2"
+  PLUGIN_VERSION = "0.5.3"
   POE_ENDPOINT   = "https://api.poe.com/v1/chat/completions"
   CONFIG_PATH    = File.expand_path("~/.sketchup_su_gpt_render.json")
 
@@ -812,10 +812,12 @@ module SuGptRender
               end
     FileUtils.mkdir_p(out_dir)
     out_path = File.join(out_dir, "#{timestamp}_#{base}_watch.png")
-    success = model.active_view.write_image(filename: out_path, width: width,
-                                            height: height, antialias: false,
-                                            transparent: false)
-    raise "write_image failed" unless success
+    with_flat_lighting(model) do
+      success = model.active_view.write_image(filename: out_path, width: width,
+                                              height: height, antialias: false,
+                                              transparent: false)
+      raise "write_image failed" unless success
+    end
     out_path
   end
 
@@ -905,11 +907,13 @@ module SuGptRender
     FileUtils.mkdir_p(out_dir)
     out_path = File.join(out_dir, "#{timestamp}_#{base}_stream.jpg")
     quality_f = (quality_pct.to_f / 100.0).clamp(0.05, 1.0)
-    success = model.active_view.write_image(filename: out_path, width: width,
-                                            height: height, antialias: false,
-                                            transparent: false,
-                                            jpeg_quality: quality_f)
-    raise "write_image failed" unless success
+    with_flat_lighting(model) do
+      success = model.active_view.write_image(filename: out_path, width: width,
+                                              height: height, antialias: false,
+                                              transparent: false,
+                                              jpeg_quality: quality_f)
+      raise "write_image failed" unless success
+    end
     out_path
   end
 
@@ -1119,11 +1123,54 @@ module SuGptRender
               end
     FileUtils.mkdir_p(out_dir)
     out_path = File.join(out_dir, "#{timestamp}_#{base}_lr_raw.png")
-    success = model.active_view.write_image(filename: out_path, width: width,
-                                            height: height, antialias: true,
-                                            transparent: false)
-    raise "write_image failed" unless success
+
+    # Snapshot the user's lighting + view options so we can restore them after
+    # capture. SU's default rendering shades faces by their normal vs the sun
+    # angle, so a pure-white wall reads as light-grey when angled away — and
+    # Gemini interprets that grey as the actual material color in its render.
+    # Disable sun-shading + shadows for the capture window, then restore.
+    with_flat_lighting(model) do
+      success = model.active_view.write_image(filename: out_path, width: width,
+                                              height: height, antialias: true,
+                                              transparent: false)
+      raise "write_image failed" unless success
+    end
     out_path
+  end
+
+  # Temporarily flatten SU's lighting so a capture writes flat material colours
+  # — no soft shading, no sun shadows, no ground shadows. Restored on exit
+  # (including when the block raises). Yielded around any write_image that
+  # gets fed to a vision model.
+  def self.with_flat_lighting(model)
+    si = model.shadow_info rescue nil
+    ro = model.rendering_options rescue nil
+    saved = {}
+    keys_si = ["UseSunForShading", "DisplayShadows", "DisplayOnAllFaces",
+               "DisplayOnGroundPlane"]
+    keys_ro = ["DisplayInstructions", "ModelTransparency", "DisplaySectionPlanes"]
+    if si
+      keys_si.each { |k| saved[[:si, k]] = si[k] rescue nil }
+    end
+    if ro
+      keys_ro.each { |k| saved[[:ro, k]] = ro[k] rescue nil }
+    end
+    begin
+      if si
+        # Both keys may not exist on older SU versions — `rescue nil` guards them.
+        si["UseSunForShading"] = false rescue nil
+        si["DisplayShadows"]   = false rescue nil
+      end
+      yield
+    ensure
+      saved.each do |(target, k), v|
+        next if v.nil?
+        case target
+        when :si then si[k] = v rescue nil if si
+        when :ro then ro[k] = v rescue nil if ro
+        end
+      end
+    end
   end
 
   def self.start_live_render
@@ -1136,7 +1183,7 @@ module SuGptRender
     @liverender[:queue]      = Queue.new
     @liverender[:in_flight]  = false
     cfg = load_config
-    interval = (cfg["live_render_interval"] || 10).to_i.clamp(5, 600)
+    interval = (cfg["live_render_interval"] || 15).to_i.clamp(5, 600)
 
     push_live_render_state(true)
     push_live_render_status("Live Render: ON (#{interval}s) — first frame in ~1s", "ok")
@@ -1222,6 +1269,14 @@ module SuGptRender
                                                 input_mime: "image/png")
         elapsed = (Time.now - started).round(1)
         puts "[GPT Render Live] render OK: #{render_path} (#{tokens} tokens, #{elapsed}s)"
+        # Default: drop the raw SU view we just sent — only the AI render is
+        # interesting to keep. Set live_render_keep_raw=true in config to
+        # retain both for debugging / before-after comparison.
+        keep_raw = (load_config["live_render_keep_raw"] == true) rescue false
+        if !keep_raw && raw_path && File.exist?(raw_path)
+          File.delete(raw_path) rescue nil
+          raw_path = nil  # so push_live_render_frame doesn't try to display a deleted file
+        end
         # Drop the result if user hit Stop while we were rendering — don't
         # push stale frames into a paused tab.
         if @liverender[:stop_flag]
@@ -1329,6 +1384,16 @@ module SuGptRender
     (tokens * LIVE_RENDER_OUTPUT_PRICE_PER_TOKEN).round(4)
   end
 
+  # Approximate USD→HKD. Pegged 7.75–7.85 since 1983; using 7.85 covers
+  # the full peg band so we never under-show the local figure. We bake this
+  # in (no FX API call) — the cost meter is informational, not invoiceable.
+  USD_TO_HKD = 7.85
+
+  # Cost in HKD for today's rendering (UI shows both USD and HKD).
+  def self.live_render_cost_today_hkd
+    (live_render_cost_today * USD_TO_HKD).round(3)
+  end
+
   # ------ tray dialog --------------------------------------------------------
   # Use ||= so that `load __FILE__` (hot-reload) preserves these references.
   # If we used = the load would reset @tray to nil and we'd lose the live dialog.
@@ -1423,8 +1488,10 @@ module SuGptRender
 
     # Live Render state for HTML
     liver_enabled   = @liverender && @liverender[:enabled] ? true : false
-    liver_interval  = (cfg["live_render_interval"] || 10).to_i
-    liver_model     = cfg["live_render_model"] || LIVE_RENDER_MODELS.first[0]
+    liver_interval  = (cfg["live_render_interval"]   || 15).to_i
+    liver_resolution = (cfg["live_render_width"]      || 1024).to_i
+    liver_keep_raw  = cfg["live_render_keep_raw"]    == true
+    liver_model     = cfg["live_render_model"]       || LIVE_RENDER_MODELS.first[0]
     liver_today     = live_render_count_today
     liver_cost      = live_render_cost_today
     liver_history_html = render_live_render_history_html
@@ -1717,10 +1784,27 @@ module SuGptRender
             </label>
             <label>Render interval
               <select id="liver_interval" onchange="setLiveRenderInterval()">
-                <option value="5"  #{liver_interval == 5  ? 'selected' : ''}>5s</option>
-                <option value="10" #{liver_interval == 10 ? 'selected' : ''}>10s</option>
+                <option value="5"  #{liver_interval == 5  ? 'selected' : ''}>5s (overlaps)</option>
+                <option value="10" #{liver_interval == 10 ? 'selected' : ''}>10s (overlaps)</option>
+                <option value="15" #{liver_interval == 15 ? 'selected' : ''}>15s (recommended)</option>
                 <option value="20" #{liver_interval == 20 ? 'selected' : ''}>20s</option>
                 <option value="30" #{liver_interval == 30 ? 'selected' : ''}>30s</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="grid row">
+            <label>Capture resolution
+              <select id="liver_resolution" onchange="setLiveRenderResolution()">
+                <option value="512"  #{liver_resolution == 512  ? 'selected' : ''}>512×512  (smallest, ~9s)</option>
+                <option value="768"  #{liver_resolution == 768  ? 'selected' : ''}>768×768  (~10s)</option>
+                <option value="1024" #{liver_resolution == 1024 ? 'selected' : ''}>1024×1024 (default, ~12s)</option>
+              </select>
+            </label>
+            <label>Keep raw captures
+              <select id="liver_keep_raw" onchange="setLiveRenderKeepRaw()">
+                <option value="0" #{!liver_keep_raw ? 'selected' : ''}>No (auto-delete after render)</option>
+                <option value="1" #{liver_keep_raw ? 'selected' : ''}>Yes (keep both)</option>
               </select>
             </label>
           </div>
@@ -1731,8 +1815,8 @@ module SuGptRender
           </div>
 
           <div class="info-grid">
-            <div>Today</div><div id="liver_today">#{liver_today} renders · ~$#{format('%.4f', liver_cost)}</div>
-            <div>Capture</div><div>PNG · 1024×1024 (image-input)</div>
+            <div>Today</div><div id="liver_today">#{liver_today} renders · ~US$#{format('%.4f', liver_cost)} (HK$#{format('%.3f', liver_cost * USD_TO_HKD)})</div>
+            <div>Output</div><div>1024×1024 PNG (model-fixed) · ~$0.0005 / render</div>
             <div>Endpoint</div><div><code>gemini-2.5-flash-image · generateContent</code></div>
           </div>
 
@@ -1898,6 +1982,8 @@ module SuGptRender
         function toggleLiveRender()       { sketchup.toggle_live_render(''); }
         function setLiveRenderInterval()  { sketchup.set_live_render_interval(document.getElementById('liver_interval').value); }
         function setLiveRenderModel()     { sketchup.set_live_render_model(document.getElementById('liver_model').value); }
+        function setLiveRenderResolution(){ sketchup.set_live_render_resolution(document.getElementById('liver_resolution').value); }
+        function setLiveRenderKeepRaw()   { sketchup.set_live_render_keep_raw(document.getElementById('liver_keep_raw').value); }
         function setLiveRenderUI(enabled) {
           const btn  = document.getElementById('liver_btn');
           const dot  = document.getElementById('liver_dot');
@@ -1936,7 +2022,8 @@ module SuGptRender
         function liveRenderDone(historyHtml, todayCount, todayCost) {
           setLiveRenderHistory(historyHtml);
           const t = document.getElementById('liver_today');
-          if (t) t.textContent = todayCount + ' renders · ~$' + todayCost;
+          // todayCost already includes the "US$x.xxx (HK$y.yyy)" formatting from Ruby
+          if (t) t.textContent = todayCount + ' renders · ~' + todayCost;
         }
         function toggleWatch() { sketchup.toggle_watch(''); }
         function setWatchDelay() { sketchup.set_watch_delay(document.getElementById('aiw_delay').value); }
@@ -2312,6 +2399,13 @@ module SuGptRender
     @tray.add_action_callback("set_live_render_model")    do |_, v|
       cfg = load_config; cfg["live_render_model"] = v.to_s; save_config(cfg)
     end
+    @tray.add_action_callback("set_live_render_resolution") do |_, v|
+      r = v.to_i.clamp(256, 2048)
+      cfg = load_config; cfg["live_render_width"] = r; cfg["live_render_height"] = r; save_config(cfg)
+    end
+    @tray.add_action_callback("set_live_render_keep_raw") do |_, v|
+      cfg = load_config; cfg["live_render_keep_raw"] = (v.to_s == "1"); save_config(cfg)
+    end
     @tray.add_action_callback("edit_live_render_prompt")  { |_, _| edit_live_render_prompt }
     @tray.add_action_callback("open_live_render_folder")  do |_, _|
       dir = history_dir
@@ -2491,7 +2585,7 @@ module SuGptRender
     return unless @tray && @tray.visible?
     html = render_live_render_history_html
     @tray.execute_script(
-      "liveRenderDone(#{html.to_json}, #{live_render_count_today}, '#{format('%.4f', live_render_cost_today)}')"
+      "liveRenderDone(#{html.to_json}, #{live_render_count_today}, 'US$#{format('%.4f', live_render_cost_today)} (HK$#{format('%.3f', live_render_cost_today_hkd)})')"
     )
   end
 

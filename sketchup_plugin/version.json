@@ -1,5 +1,5 @@
 {
-  "version": "0.5.2",
+  "version": "0.5.3",
   "rb_url": "https://hohomehk-plugin.ngrok.app/su_gpt_render.rb",
-  "notes": "v0.5.2 — Auto-update endpoint migrated off public GitHub. UPDATE_MANIFEST_URL and rb_url now both point at https://hohomehk-plugin.ngrok.app (no auth, served from local box via ngrok). The shipped .rb continues to bundle the cf-aig-authorization token (BYOK requires it on the gateway side per CF docs), but because the .rb lives only behind a private tunnel, GitHub / CF leaked-token scanners never see it. We burned 3 tokens to public GitHub releases learning this; this design ends the revoke cycle. WP server keeps using AI Gateway directly (token there lives only in wp_options on the private deco2hk-srv host)."
+  "notes": "v0.5.3 — three quality-of-life fixes for Live Render. (1) with_flat_lighting helper temporarily disables UseSunForShading + DisplayShadows during every capture (live_render, live_stream, ai_watch) so a pure-white SU wall doesn't read as light-grey to Gemini and get re-rendered as a grey wall. Restore on exit even if write_image raises. (2) Auto-delete the raw SU view after Gemini returns (set live_render_keep_raw=true to keep both). Solves folder-clutter complaint — the AI render is what you want to keep, not the input. (3) Capture resolution dropdown (512/768/1024) and sane interval default 15s instead of 10s (rendering takes ~12s; smaller intervals just spam in_flight=true ticks). Cost meter now shows HKD too (US$x.xxxx + HK$y.yyy at 7.85 peg)."
 }
